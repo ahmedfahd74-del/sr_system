@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+#
+# sr - one-stop launcher for the sr_system trading toolkit
+#
+# Lets you run any sr_system task from any directory without remembering
+# the PYTHONPATH dance or which file lives where.
+#
+# Usage:
+#   sr scan    [TICKER] [TIMEFRAME] [INTERVAL]   live dashboard, polling Yahoo
+#   sr levels  [TICKER] [TIMEFRAME]              export Pine v6 levels (autocopy)
+#   sr chart   [TICKER] [TIMEFRAME]              one-shot static chart
+#   sr test                                      run the full unittest suite
+#   sr open                                      open the project in Finder
+#   sr help                                      show this help
+#
+# Defaults are AMD / 1D / 30s when an arg is omitted.
+#
+# First-time setup (run once):
+#   chmod +x bin/sr
+#   echo 'export PATH="$HOME/sr_system/bin:$PATH"' >> ~/.zshrc
+#   source ~/.zshrc
+# After that, just type `sr scan AMD` from any directory.
+
+set -e
+
+# ---------------------------------------------------------------------------
+# Locate the sr_system repo regardless of where this script lives or is called.
+# ---------------------------------------------------------------------------
+_SR_BIN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd -P )"
+SR_HOME="${SR_HOME:-$( cd "${_SR_BIN_DIR}/.." && pwd -P )}"
+
+if [[ ! -f "${SR_HOME}/core/engine.py" ]]; then
+    echo "sr: cannot find sr_system at ${SR_HOME}" >&2
+    echo "    set SR_HOME or move bin/sr inside the repo." >&2
+    exit 1
+fi
+
+cd "${SR_HOME}"
+export PYTHONPATH="${SR_HOME}"
+
+# ---------------------------------------------------------------------------
+# Pretty output
+# ---------------------------------------------------------------------------
+_c_bold=$'\033[1m'
+_c_green=$'\033[32m'
+_c_cyan=$'\033[36m'
+_c_yellow=$'\033[33m'
+_c_dim=$'\033[2m'
+_c_off=$'\033[0m'
+
+_say() { printf "%s[sr]%s %s\n" "$_c_cyan" "$_c_off" "$*"; }
+_warn() { printf "%s[sr]%s %s\n" "$_c_yellow" "$_c_off" "$*"; }
+
+_clip() {
+    # Copy stdin to clipboard if a clipboard tool is available.
+    if command -v pbcopy >/dev/null 2>&1; then
+        pbcopy
+        return 0
+    fi
+    if command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard
+        return 0
+    fi
+    if command -v wl-copy >/dev/null 2>&1; then
+        wl-copy
+        return 0
+    fi
+    cat >/dev/null
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+cmd_scan() {
+    local ticker="${1:-AMD}"
+    local tf="${2:-1D}"
+    local interval="${3:-30}"
+    _say "live scanner: ${_c_bold}${ticker}${_c_off} on ${tf}, polling every ${interval}s. Ctrl+C to stop."
+    exec python3 notebooks/live_dashboard.py "$ticker" "$tf" "$interval"
+}
+
+cmd_levels() {
+    local ticker="${1:-AMD}"
+    local tf="${2:-1D}"
+    local safe_ticker="${ticker//-/_}"
+    local out_file="notebooks/exports/${safe_ticker}_${tf}_levels.pine"
+
+    _say "exporting Pine indicator for ${_c_bold}${ticker}${_c_off} ${tf} ..."
+    python3 notebooks/export_to_tradingview.py "$ticker" "$tf"
+
+    if [[ -f "$out_file" ]]; then
+        if cat "$out_file" | _clip; then
+            printf "%s[sr]%s %sPine source copied to clipboard.%s\n" \
+                "$_c_cyan" "$_c_off" "$_c_green" "$_c_off"
+            printf "      paste into TradingView Pine Editor (cmd+V), Save, Add to chart.\n"
+        else
+            _warn "no clipboard utility (pbcopy/xclip) available."
+            _warn "open the file manually:"
+            echo "      $out_file"
+        fi
+    else
+        _warn "expected output not found at $out_file"
+        return 1
+    fi
+}
+
+cmd_chart() {
+    local ticker="${1:-AMD}"
+    local tf="${2:-1D}"
+    _say "rendering static chart for ${_c_bold}${ticker}${_c_off} ${tf} ..."
+    python3 notebooks/visualize.py "$ticker" "$tf"
+}
+
+cmd_test() {
+    _say "running unit tests ..."
+    python3 -m unittest discover tests "$@"
+}
+
+cmd_open() {
+    if command -v open >/dev/null 2>&1; then
+        open "${SR_HOME}"
+    else
+        echo "${SR_HOME}"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+${_c_bold}sr${_c_off} - sr_system trading toolkit launcher
+
+${_c_bold}Commands${_c_off}
+  ${_c_green}sr scan${_c_off}   [TICKER] [TF] [INTERVAL]   live dashboard, polls Yahoo
+  ${_c_green}sr levels${_c_off} [TICKER] [TF]              export Pine v6 + auto-copy
+  ${_c_green}sr chart${_c_off}  [TICKER] [TF]              static chart png
+  ${_c_green}sr test${_c_off}                              run full unittest suite
+  ${_c_green}sr open${_c_off}                              open project in Finder
+  ${_c_green}sr help${_c_off}                              this help
+
+${_c_bold}Defaults${_c_off}
+  TICKER    AMD
+  TF        1D    (also: 1m 5m 15m 1H 4H)
+  INTERVAL  30 seconds
+
+${_c_bold}Examples${_c_off}
+  ${_c_dim}# Watch AMD daily, refresh every 30s${_c_off}
+  sr scan AMD 1D 30
+
+  ${_c_dim}# Watch SPY 1H, refresh every minute${_c_off}
+  sr scan SPY 1H 60
+
+  ${_c_dim}# Watch crypto, 5m bars, refresh every 15s${_c_off}
+  sr scan BTC-USD 5m 15
+
+  ${_c_dim}# Generate Pine indicator and copy to clipboard${_c_off}
+  sr levels AMD 1D
+  sr levels NVDA 1H
+  sr levels ETH-USD 1D
+
+  ${_c_dim}# Run a one-shot static chart (writes a PNG)${_c_off}
+  sr chart SPY 1D
+
+${_c_bold}Project${_c_off}
+  SR_HOME = ${SR_HOME}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+case "${1:-help}" in
+    scan)    shift; cmd_scan    "$@" ;;
+    levels)  shift; cmd_levels  "$@" ;;
+    chart)   shift; cmd_chart   "$@" ;;
+    test)    shift; cmd_test    "$@" ;;
+    open)    shift; cmd_open    "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+        _warn "unknown command: $1"
+        echo ""
+        cmd_help
+        exit 2
+        ;;
+esac
