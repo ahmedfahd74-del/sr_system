@@ -1,0 +1,6 @@
+numpy>=1.21.0
+yfinance>=0.2.0
+sqlite3 (built-in)
+matplotlib>=3.5.0
+scikit-learn>=1.0.0  # For future AI models
+lightgbm>=3.0.0     # For regime prediction
