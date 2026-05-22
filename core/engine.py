@@ -19,6 +19,9 @@ from detection.trendline import (
 from detection.fractal import (
     FractalLevel, detect_fractal_sr, merge_fractal_levels, get_fractal_channels
 )
+from ai.pattern import analyze_pattern, PatternResult
+from ai.signal_enhancer import enhance_signal as enhance_sr_signal, EnhancedSignal
+from ai.features import extract_all_features
 
 
 # Unified S/R level type for combined output
@@ -421,6 +424,64 @@ class SREngine:
             analysis["regime"] = regime.name
 
         return analysis
+
+    def analyze_pattern(self, ticker: str, primary_tf: str = "1D") -> PatternResult:
+        """Analyze market for pattern detection (AI Phase 3)."""
+        mtf_data = self._get_mtf_data(ticker)
+
+        if primary_tf not in mtf_data:
+            return PatternResult(
+                pattern_type="UNKNOWN",
+                confidence=0,
+                action="WAIT",
+                reasoning="No data available",
+                additional_data={}
+            )
+
+        data = mtf_data[primary_tf]
+        return analyze_pattern(data)
+
+    def enhance_signal(self, ticker: str, direction: str,
+                       primary_tf: str = "1D") -> EnhancedSignal:
+        """Enhance a trading signal with entry timing (AI Phase 3)."""
+        mtf_data = self._get_mtf_data(ticker)
+
+        if primary_tf not in mtf_data:
+            return EnhancedSignal(
+                base_action="HOLD",
+                entry_price=0, stop_loss=0, take_profit=0,
+                risk_reward_ratio=0, entry_confidence=0,
+                entry_zone_low=0, entry_zone_high=0,
+                reasoning="No data available",
+                warnings=["No market data"]
+            )
+
+        data = mtf_data[primary_tf]
+
+        # Get nearest level based on direction
+        current_price = data.closes[-1]
+        support, resistance = self.get_nearest_levels(ticker, current_price)
+
+        if direction == "support" and support:
+            sr_level = support[0].price
+        elif direction == "resistance" and resistance:
+            sr_level = resistance[0].price
+        else:
+            return EnhancedSignal(
+                base_action="HOLD",
+                entry_price=0, stop_loss=0, take_profit=0,
+                risk_reward_ratio=0, entry_confidence=0,
+                entry_zone_low=0, entry_zone_high=0,
+                reasoning=f"No {direction} levels found",
+                warnings=["No relevant S/R level"]
+            )
+
+        # Get ATR for the data
+        from detection.horizontal import atr as compute_atr
+        atr_vals = compute_atr(data)
+        atr = atr_vals[-1] if len(atr_vals) > 0 else (data.highs[-1] - data.lows[-1])
+
+        return enhance_sr_signal(data, sr_level, direction, current_price, atr)
 
 
 # Singleton instance

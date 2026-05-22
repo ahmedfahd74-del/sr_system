@@ -66,6 +66,10 @@ class OHLCVData:
         return np.array([b.close for b in self.bars])
 
     @property
+    def opens(self) -> np.ndarray:
+        return np.array([b.open for b in self.bars])
+
+    @property
     def highs(self) -> np.ndarray:
         return np.array([b.high for b in self.bars])
 
