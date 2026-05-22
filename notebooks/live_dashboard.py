@@ -223,13 +223,40 @@ class LiveRunner:
 
         # 7) Render
         self.dashboard.render()
-        if not _is_interactive():
-            out_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                f"{self.ticker}_live.png",
-            )
-            self.dashboard._fig.savefig(out_path, dpi=120, facecolor="#1a1a2e")
+
+        # Always save a snapshot PNG. On Mac this is the most reliable way for
+        # the user to actually SEE the dashboard - the matplotlib MacOSX backend
+        # is flaky about popping a window from a long-running terminal script.
+        out_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"{self.ticker}_live.png",
+        )
+        self.dashboard._fig.savefig(out_path, dpi=120, facecolor="#1a1a2e")
+
+        if self.tick_count == 1:
+            # First tick: print a banner showing how to open the snapshot.
+            print()
+            print("=" * 60)
+            print("[live] DASHBOARD SNAPSHOT saved at:")
+            print(f"       {out_path}")
+            print()
+            print("[live] To view it, in a SEPARATE terminal run:")
+            print(f"       open {out_path}")
+            print()
+            print("[live] Preview will pop up. Close + reopen to see updates,")
+            print("       or just leave it - we resave it every tick.")
+            print("=" * 60)
+            print()
+        else:
             print(f"[live] snapshot -> {out_path}")
+
+        # On macOS, give the matplotlib event loop a tiny window of time to
+        # actually refresh any open GUI window. Cheap, harmless on other OSes.
+        if sys.platform == "darwin":
+            try:
+                plt.pause(0.01)
+            except Exception:
+                pass
 
     # -- main loop --------------------------------------------------------
 
