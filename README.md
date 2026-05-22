@@ -37,10 +37,14 @@ sr_system/
 │   └── fractal.py      # Bill Williams fractals
 ├── adaptive/
 ├── ai/
+│   ├── features.py      # Market feature extraction
+│   ├── pattern.py       # Pattern recognition
+│   └── signal_enhancer.py  # Entry timing & risk management
 ├── signals/
 ├── tests/
-│   ├── test_detection.py   # Unit tests (27 tests)
-│   └── test_full_system.py # Integration tests (10 tests)
+│   ├── test_detection.py    # Unit tests (27 tests)
+│   ├── test_ai_modules.py   # AI module tests (24 tests)
+│   └── test_full_system.py  # Integration tests (10 tests)
 └── notebooks/
     └── visualize.py    # Chart visualization
 ```
@@ -128,19 +132,74 @@ Each S/R level is scored 0-100 based on:
 ## Testing
 
 - **27 unit tests** covering all detection modules
+- **24 AI module tests** covering pattern recognition and signal enhancement
 - **10 integration tests** covering full system pipeline
 - Tests for edge cases: empty data, flat data, extreme volatility
 
 ```bash
 # Run all tests
 python3 -m unittest discover tests -v
+
+# Run AI module tests specifically
+PYTHONPATH=. python3 -m unittest tests.test_ai_modules -v
+```
+
+## AI Enhancement (Phase 3)
+
+The AI module provides intelligent market analysis for better trade timing.
+
+### Features Extraction
+- **ATR**: Current vs average volatility ratio
+- **Volume**: Ratio, coefficient of variation, uniformity
+- **Momentum**: Price change percentage over lookback
+- **Range Narrowing**: 5-bar vs 20-bar range compression
+- **ADX**: Trend strength (0-100) and direction
+- **Consolidation Score**: 0-100, how compressed price is
+- **Symmetry Score**: How symmetric the consolidation is
+
+### Pattern Recognition
+Detects market patterns to suggest actions:
+
+| Pattern | Action | Conditions |
+|---------|--------|------------|
+| CONSOLIDATION | HOLD | Range compression + stable volume |
+| BREAKOUT_IMMINENT | BUY/SELL | Compression + volume buildup + momentum |
+| FALSE_BREAKOUT | SELL/BUY | Strong move + reversal + high volume |
+| TREND_CONTINUATION | BUY/SELL | Strong ADX + healthy momentum |
+
+### Signal Enhancement
+Provides entry timing with risk management:
+- **Entry Zone**: Optimal buy/sell zone around S/R level
+- **Stop Loss**: Based on recent structure and ATR
+- **Take Profit**: Based on volatility expansion estimate
+- **Risk/Reward**: Calculated ratio for trade validation
+- **Confidence Score**: 0-100 based on multiple factors
+
+### Usage Example
+```python
+from core.engine import SREngine
+
+engine = SREngine()
+
+# Analyze market pattern
+pattern = engine.analyze_pattern("AMD", "1D")
+print(f"Pattern: {pattern.pattern_type.value}")
+print(f"Action: {pattern.action.value}")
+print(f"Confidence: {pattern.confidence:.0f}%")
+
+# Enhance a support signal
+signal = engine.enhance_signal("AMD", "support", "1D")
+print(f"Entry: ${signal.entry_price:.2f}")
+print(f"Stop: ${signal.stop_loss:.2f}")
+print(f"TP: ${signal.take_profit:.2f}")
+print(f"Risk/Reward: {signal.risk_reward_ratio:.1f}:1")
 ```
 
 ## Current Status
 
 ✅ Phase 1: Foundation (Data layer, Horizontal S/R, Engine)  
 ✅ Phase 2: Multi-Method Detection (Trendline, Fractal)  
-⏳ Phase 3: AI Enhancement (Pattern recognition, ML models)  
+✅ Phase 3: AI Enhancement (Pattern recognition, Signal enhancement)  
 ⏳ Phase 4: Production (Real-time streaming, Dashboard, Alerts)
 
 ## License
