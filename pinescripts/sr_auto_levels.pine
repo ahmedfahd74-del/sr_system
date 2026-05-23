@@ -1,152 +1,70 @@
 //@version=6
-indicator("SR Auto Levels (sr_system)", "SR Auto", overlay=true, max_lines_count=30, max_labels_count=30, max_bars_back=5000)
+indicator("SR Auto Levels", "SR Auto", overlay=true, max_lines_count=30, max_labels_count=30, max_bars_back=5000)
 
 // ============================================================
-// SR AUTO LEVELS - Pine v6 native auto-detecting S/R indicator
+// SR AUTO Levels - price-visit heatmap approach
 // ============================================================
-// Add ONCE to TradingView, works on EVERY chart you open.
-// Auto-detects support/resistance from pivot highs/lows on the
-// current timeframe AND up to 3 higher timeframes, then ranks by:
-//   - touch count
-//   - recency
-//   - multi-timeframe confluence
-// and draws the top N.
+// Places a horizontal line through every price area where the
+// chart has ACTUALLY VISITED the most - exactly the same logic
+// used when drawing levels by hand.
 //
-// No Python, no manual paste of levels, no per-ticker setup.
-// Switch from AMD to BTCUSDT.P to SOLUSDT.P and it just works.
+// Algorithm
+// ---------
+// 1. Divide the lookback price range into equal-sized buckets.
+//    Bucket width = zone_atr_mult x ATR14 (auto-scales per asset/TF).
+// 2. For every bar in the lookback count how many bars had their
+//    HIGH >= bucket_mid AND LOW <= bucket_mid  (= "touched this area").
+// 3. Keep buckets touched >= min_touches times.
+// 4. Merge adjacent hot buckets into a single zone (running avg).
+// 5. Sort by touch count, draw the top N as horizontal lines.
+//    Line extends both ways by default so it looks like a proper
+//    S/R line drawn by hand.
+//
+// Works on every ticker without any per-chart tuning.
+// Add ONCE - auto-adapts when you switch symbols.
 // ============================================================
 
-// ============================================================
-// TYPES
-// ============================================================
-type Pivot
-    float price
-    int   bar
-    bool  isHigh
-    int   tfRank        // 0 = current TF, 1..3 = HTF rank
-
-type Level
-    float price
-    int   touches
-    int   htfHits       // how many HTFs have a pivot near this level
-    int   firstBar
-    int   lastBar
-    bool  isSupport
-    float strength      // composite score 0..100
-
-// ============================================================
+// --------------------------------------------------------------
 // INPUTS
-// ============================================================
-g_det     = "Detection"
-i_autoTune     = input.bool(true, "Auto-tune pivot length", group=g_det, tooltip="Adapts pivot length to chart timeframe (intraday = tighter, daily = looser).")
-i_pivLenManual = input.int(10, "Manual pivot length", minval=2, maxval=50, group=g_det)
-i_lookback     = input.int(500, "Lookback bars", minval=50, maxval=5000, group=g_det)
-i_minTouches   = input.int(2, "Min touches per level", minval=1, maxval=10, group=g_det)
-i_zoneTolPct   = input.float(0.30, "Cluster tolerance (% of price)", minval=0.05, maxval=2.0, step=0.05, group=g_det)
-i_topN         = input.int(8, "Levels to display", minval=1, maxval=20, group=g_det)
+// --------------------------------------------------------------
+g_det = "Detection"
+i_lookback    = input.int(300,  "Lookback bars",               minval=50, maxval=5000,           group=g_det, tooltip="How many bars to scan back. 300 = ~1 year on daily.")
+i_zoneMult    = input.float(1.0, "Zone width (x ATR14)",        minval=0.2, maxval=5.0, step=0.1, group=g_det, tooltip="Width of each price bucket as a multiple of ATR. Larger = coarser zones (fewer, wider levels). Smaller = finer zones (more, narrower levels). 1.0 works well for most assets.")
+i_minTouches  = input.int(3,    "Min bar-visits per level",     minval=1, maxval=50,              group=g_det, tooltip="A level only appears if this many bars in the lookback touched its price zone. 3 = at least 3 separate visits required.")
+i_topN        = input.int(8,    "Levels to display (top N)",    minval=1, maxval=20,              group=g_det, tooltip="After filtering, draw only the N most-visited zones.")
 
-g_mtf     = "Multi-Timeframe"
-i_mtfEnable = input.bool(true, "Enable HTF anchoring", group=g_mtf)
-i_htf1      = input.timeframe("60", "HTF 1 (1H)",   group=g_mtf)
-i_htf2      = input.timeframe("240", "HTF 2 (4H)",  group=g_mtf)
-i_htf3      = input.timeframe("D", "HTF 3 (Daily)", group=g_mtf)
+g_line = "Line Appearance"
+i_extMode  = input.string("Both",   "Line extend",   options=["None","Left only","Right only","Both"], group=g_line, tooltip="Both = full horizontal across the chart (looks like manual hand-drawn lines). Right only = projects forward only.")
+i_lineStyl = input.string("Dashed", "Line style",    options=["Solid","Dashed","Dotted"],               group=g_line)
+i_lwBase   = input.int(1, "Base line width",   minval=1, maxval=4, group=g_line)
+i_lwMax    = input.int(2, "Max  line width",   minval=1, maxval=4, group=g_line, tooltip="Most-visited level uses this width. Scales down linearly.")
+i_lbOffset = input.int(8, "Label offset (bars right)", minval=1, maxval=50, group=g_line, tooltip="How far to the right of the last bar the price label is placed.")
 
-g_score   = "Scoring weights (relative)"
-i_wTouches = input.float(0.40, "Touches weight",        minval=0, maxval=1, step=0.05, group=g_score)
-i_wRecency = input.float(0.20, "Recency weight",        minval=0, maxval=1, step=0.05, group=g_score)
-i_wHTF     = input.float(0.40, "HTF confluence weight", minval=0, maxval=1, step=0.05, group=g_score)
+g_style = "Colors"
+i_cSupp = input.color(color.new(#00C853, 0), "Support  color", group=g_style)
+i_cRes  = input.color(color.new(#FF1744, 0), "Resistance color", group=g_style)
+i_showLbls = input.bool(true, "Show price labels", group=g_style)
+i_showTbl  = input.bool(true, "Show status table", group=g_style)
 
-g_style   = "Style"
-i_cSupp        = input.color(color.new(#00C853, 0), "Support color",    group=g_style)
-i_cRes         = input.color(color.new(#FF1744, 0), "Resistance color", group=g_style)
-i_cConfBoost   = input.color(color.new(#FFD600, 0), "MTF confluence highlight", group=g_style, tooltip="Levels with HTF confluence borrow this color tint for the label.")
-i_lwBase       = input.int(1, "Base line width", minval=1, maxval=4, group=g_style)
-i_lwMax        = input.int(3, "Max  line width", minval=1, maxval=4, group=g_style)
-i_showLabels   = input.bool(true, "Show level labels", group=g_style)
-i_extendLines  = input.bool(true, "Extend lines to right edge", group=g_style)
+// --------------------------------------------------------------
+// TRANSLATE STYLE INPUTS TO PINE CONSTANTS
+// --------------------------------------------------------------
+extMode = i_extMode == "None" ? extend.none : i_extMode == "Left only" ? extend.left : i_extMode == "Right only" ? extend.right : extend.both
+lineStyl = i_lineStyl == "Dashed" ? line.style_dashed : i_lineStyl == "Dotted" ? line.style_dotted : line.style_solid
 
-g_table   = "Status Table"
-i_showTable = input.bool(true, "Show status table (top right)", group=g_table)
-
-// ============================================================
-// AUTO-TUNE
-// ============================================================
-tfMin = timeframe.in_seconds() / 60
-pivLenAuto = tfMin <= 5 ? 12 : tfMin <= 60 ? 10 : tfMin <= 240 ? 8 : 6
-pivLen = i_autoTune ? pivLenAuto : i_pivLenManual
-
-atr20 = ta.atr(20)
-
-// ============================================================
-// PIVOT DETECTION (current TF)
-// ============================================================
-ph = ta.pivothigh(high, pivLen, pivLen)
-pl = ta.pivotlow(low,   pivLen, pivLen)
-
-// ============================================================
-// HTF PIVOT BUNDLE (one security call per HTF)
-// ============================================================
-f_htfBundle(simple int n) =>
-    [ta.pivothigh(high, n, n), ta.pivotlow(low, n, n)]
-
-[h1Ph, h1Pl] = request.security(syminfo.tickerid, i_htf1, f_htfBundle(pivLen), lookahead=barmerge.lookahead_off)
-[h2Ph, h2Pl] = request.security(syminfo.tickerid, i_htf2, f_htfBundle(pivLen), lookahead=barmerge.lookahead_off)
-[h3Ph, h3Pl] = request.security(syminfo.tickerid, i_htf3, f_htfBundle(pivLen), lookahead=barmerge.lookahead_off)
-
-// ============================================================
-// ACCUMULATE PIVOTS
-// ============================================================
-var array<Pivot> pivots = array.new<Pivot>()
-
-// Dedup state for HTF pivots (HTF prints repeat across many bars)
-var float lh1p = na
-var float lh1l = na
-var float lh2p = na
-var float lh2l = na
-var float lh3p = na
-var float lh3l = na
-
-if not na(ph)
-    pivots.push(Pivot.new(price=ph, bar=bar_index-pivLen, isHigh=true,  tfRank=0))
-if not na(pl)
-    pivots.push(Pivot.new(price=pl, bar=bar_index-pivLen, isHigh=false, tfRank=0))
-
-if i_mtfEnable
-    if not na(h1Ph) and h1Ph != lh1p
-        pivots.push(Pivot.new(price=h1Ph, bar=bar_index, isHigh=true,  tfRank=1))
-        lh1p := h1Ph
-    if not na(h1Pl) and h1Pl != lh1l
-        pivots.push(Pivot.new(price=h1Pl, bar=bar_index, isHigh=false, tfRank=1))
-        lh1l := h1Pl
-    if not na(h2Ph) and h2Ph != lh2p
-        pivots.push(Pivot.new(price=h2Ph, bar=bar_index, isHigh=true,  tfRank=2))
-        lh2p := h2Ph
-    if not na(h2Pl) and h2Pl != lh2l
-        pivots.push(Pivot.new(price=h2Pl, bar=bar_index, isHigh=false, tfRank=2))
-        lh2l := h2Pl
-    if not na(h3Ph) and h3Ph != lh3p
-        pivots.push(Pivot.new(price=h3Ph, bar=bar_index, isHigh=true,  tfRank=3))
-        lh3p := h3Ph
-    if not na(h3Pl) and h3Pl != lh3l
-        pivots.push(Pivot.new(price=h3Pl, bar=bar_index, isHigh=false, tfRank=3))
-        lh3l := h3Pl
-
-// Cap memory so long history never blows up.
-if pivots.size() > 5000
-    pivots.shift()
-
-// ============================================================
+// --------------------------------------------------------------
 // DRAWING STATE
-// ============================================================
+// --------------------------------------------------------------
 var array<line>  drawnLines  = array.new<line>()
 var array<label> drawnLabels = array.new<label>()
-var table tStat = table.new(position.top_right, 1, 4, frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+var table tbl = table.new(position.top_right, 1, 5, frame_color=color.new(color.gray,60), frame_width=1, border_color=color.new(color.gray,70), border_width=1)
 
-// ============================================================
-// PROCESS & DRAW (last bar only)
-// ============================================================
+// --------------------------------------------------------------
+// MAIN LOGIC - runs only on the last bar
+// --------------------------------------------------------------
 if barstate.islast
 
+    // Clean up previous drawings
     for ln in drawnLines
         line.delete(ln)
     drawnLines.clear()
@@ -154,153 +72,227 @@ if barstate.islast
         label.delete(lb)
     drawnLabels.clear()
 
-    // 1) Filter pivots to lookback window
-    int cutoff = bar_index - i_lookback
-    array<Pivot> raw = array.new<Pivot>()
-    if pivots.size() > 0
-        for i = 0 to pivots.size() - 1
-            p = pivots.get(i)
-            if p.bar >= cutoff
-                raw.push(p)
+    // -- 1. Measure the lookback range and ATR ------------------
+    int   barsBack  = math.min(i_lookback, bar_index)
+    float atr14     = ta.atr(14)
+    float zoneWidth = na(atr14) or atr14 <= 0.0 ? close * 0.005 : atr14 * i_zoneMult
 
-    // 2) Cluster pivots into levels
-    array<Level> levels = array.new<Level>()
-    float zone = close * i_zoneTolPct / 100.0
+    float rangeHigh = high
+    float rangeLow  = low
+    if barsBack > 0
+        for i = 1 to barsBack - 1
+            float h = high[i]
+            float l = low[i]
+            if not na(h) and h > rangeHigh
+                rangeHigh := h
+            if not na(l) and l < rangeLow
+                rangeLow := l
 
-    if raw.size() > 0
-        for i = 0 to raw.size() - 1
-            p = raw.get(i)
-            bool merged = false
-            int lN = levels.size()
-            if lN > 0
-                for j = 0 to lN - 1
-                    L = levels.get(j)
-                    if math.abs(p.price - L.price) <= zone
-                        int t = L.touches
-                        L.price    := (L.price * t + p.price) / (t + 1)
-                        L.touches  := t + 1
-                        if p.tfRank > 0
-                            L.htfHits := L.htfHits + 1
-                        L.firstBar := math.min(L.firstBar, p.bar)
-                        L.lastBar  := math.max(L.lastBar,  p.bar)
-                        merged := true
-                        break
-            if not merged
-                levels.push(Level.new(
-                     price     = p.price,
-                     touches   = 1,
-                     htfHits   = p.tfRank > 0 ? 1 : 0,
-                     firstBar  = p.bar,
-                     lastBar   = p.bar,
-                     isSupport = p.price <= close,
-                     strength  = 0.0))
+    // Guard against degenerate ranges
+    float totalRange = rangeHigh - rangeLow
+    if totalRange <= 0.0
+        totalRange := zoneWidth * 2.0
+        rangeLow   := close - zoneWidth
+        rangeHigh  := close + zoneWidth
 
-    // 3) Score each level
-    if levels.size() > 0
-        for i = 0 to levels.size() - 1
-            L = levels.get(i)
-            float touchScore   = math.min(100.0, float(L.touches) * 12.0)
-            float age          = math.max(1.0, float(bar_index - L.lastBar))
-            float recencyScore = 100.0 / (1.0 + age / 200.0)
-            float htfScore     = math.min(100.0, float(L.htfHits) * 35.0)
-            float wSum = math.max(0.0001, i_wTouches + i_wRecency + i_wHTF)
-            L.strength := (touchScore * i_wTouches + recencyScore * i_wRecency + htfScore * i_wHTF) / wSum
-            L.isSupport := L.price <= close
+    // -- 2. Build price buckets and count bar-visits ------------
+    int numBuckets = math.max(1, int(math.ceil(totalRange / zoneWidth)))
+    // Cap to avoid huge arrays on very fine zones
+    numBuckets := math.min(numBuckets, 500)
+    float effectiveBucketW = totalRange / float(numBuckets)
 
-    // 4) Filter by min touches
-    array<Level> filtered = array.new<Level>()
-    if levels.size() > 0
-        for i = 0 to levels.size() - 1
-            L = levels.get(i)
-            if L.touches >= i_minTouches
-                filtered.push(L)
+    array<int>   bucketHits  = array.new<int>(numBuckets, 0)
+    array<float> bucketFirst = array.new<float>(numBuckets, float(bar_index))  // first-bar index of earliest hit
 
-    // 5) Sort by strength desc
-    int sz = filtered.size()
-    if sz > 1
-        for i = 0 to sz - 2
+    if barsBack > 0
+        for i = 0 to barsBack - 1
+            float h = high[i]
+            float l = low[i]
+            if na(h) or na(l)
+                continue
+            // Find which buckets this bar's range overlaps
+            int bLo = int(math.floor((l - rangeLow) / effectiveBucketW))
+            int bHi = int(math.floor((h - rangeLow) / effectiveBucketW))
+            bLo := math.max(0, math.min(numBuckets - 1, bLo))
+            bHi := math.max(0, math.min(numBuckets - 1, bHi))
+            for b = bLo to bHi
+                bucketHits.set(b, bucketHits.get(b) + 1)
+                float curFirst = bucketFirst.get(b)
+                float thisBar  = float(bar_index - i)
+                if thisBar < curFirst
+                    bucketFirst.set(b, thisBar)
+
+    // -- 3. Collect hot buckets (>= min_touches) ---------------
+    // Then merge adjacent hot buckets into single zones
+    array<float> zonePrice  = array.new<float>()
+    array<int>   zoneTouches = array.new<int>()
+    array<int>   zoneFirstBar = array.new<int>()
+
+    bool inZone    = false
+    float zSum     = 0.0
+    int   zCount   = 0
+    int   zTouches = 0
+    int   zFirst   = bar_index
+
+    for b = 0 to numBuckets - 1
+        int hits = bucketHits.get(b)
+        if hits >= i_minTouches
+            float bucketMid = rangeLow + (float(b) + 0.5) * effectiveBucketW
+            int   fb        = int(bucketFirst.get(b))
+            if not inZone
+                inZone    := true
+                zSum      := bucketMid
+                zCount    := 1
+                zTouches  := hits
+                zFirst    := fb
+            else
+                zSum     += bucketMid
+                zCount   += 1
+                zTouches := math.max(zTouches, hits)
+                if fb < zFirst
+                    zFirst := fb
+        else
+            if inZone
+                zonePrice.push(zSum / float(zCount))
+                zoneTouches.push(zTouches)
+                zoneFirstBar.push(zFirst)
+                inZone := false
+    // flush last zone
+    if inZone
+        zonePrice.push(zSum / float(zCount))
+        zoneTouches.push(zTouches)
+        zoneFirstBar.push(zFirst)
+
+    int numZones = zonePrice.size()
+
+    // -- 4. Sort by touch count descending (selection sort) ----
+    if numZones > 1
+        for i = 0 to numZones - 2
             int maxIdx = i
-            for j = i + 1 to sz - 1
-                if filtered.get(j).strength > filtered.get(maxIdx).strength
+            for j = i + 1 to numZones - 1
+                if zoneTouches.get(j) > zoneTouches.get(maxIdx)
                     maxIdx := j
             if maxIdx != i
-                Level tmp = filtered.get(i)
-                filtered.set(i, filtered.get(maxIdx))
-                filtered.set(maxIdx, tmp)
+                float tp = zonePrice.get(i)
+                int   tt = zoneTouches.get(i)
+                int   tf = zoneFirstBar.get(i)
+                zonePrice.set(i,    zonePrice.get(maxIdx))
+                zoneTouches.set(i,  zoneTouches.get(maxIdx))
+                zoneFirstBar.set(i, zoneFirstBar.get(maxIdx))
+                zonePrice.set(maxIdx,    tp)
+                zoneTouches.set(maxIdx,  tt)
+                zoneFirstBar.set(maxIdx, tf)
 
-    // 6) Draw top N
-    int topN = math.min(i_topN, filtered.size())
-    int suppCount = 0
-    int resCount = 0
-    float topStrength = topN > 0 ? filtered.get(0).strength : 0.0
+    // -- 5. Draw top N -----------------------------------------
+    int   drawn    = 0
+    int   maxTouches = numZones > 0 ? zoneTouches.get(0) : i_minTouches
+    int   suppCount = 0
+    int   resCount  = 0
+    int   topN      = math.min(i_topN, numZones)
 
     if topN > 0
         for i = 0 to topN - 1
-            L = filtered.get(i)
-            color baseCol = L.isSupport ? i_cSupp : i_cRes
-            float ratio = topStrength > 0 ? L.strength / topStrength : 0.0
-            int width = i_lwBase + int(math.floor(ratio * (i_lwMax - i_lwBase)))
-            width := math.max(i_lwBase, math.min(i_lwMax, width))
+            float lp  = zonePrice.get(i)
+            int   lt  = zoneTouches.get(i)
+            int   lfb = zoneFirstBar.get(i)
 
-            int x1 = math.max(L.firstBar, bar_index - i_lookback)
-            int x2 = bar_index + (i_extendLines ? 30 : 1)
+            bool  isSupp  = lp <= close
+            color col     = isSupp ? i_cSupp : i_cRes
 
-            line ln = line.new(x1=x1, y1=L.price, x2=x2, y2=L.price, xloc=xloc.bar_index, extend=(i_extendLines ? extend.right : extend.none), color=baseCol, width=width, style=line.style_solid)
+            // Width: scales from base to max based on relative touch count
+            float ratio = maxTouches > 0 ? float(lt) / float(maxTouches) : 0.0
+            int   lw    = i_lwBase + int(math.round(ratio * float(i_lwMax - i_lwBase)))
+            lw := math.max(i_lwBase, math.min(i_lwMax, lw))
+
+            // x1 = where this level was first seen, x2 = beyond current bar
+            int x1 = math.max(lfb, bar_index - barsBack)
+            int x2 = bar_index + i_lbOffset
+
+            line ln = line.new(x1=x1, y1=lp, x2=x2, y2=lp,
+                 xloc=xloc.bar_index,
+                 extend=extMode,
+                 color=col,
+                 width=lw,
+                 style=lineStyl)
             drawnLines.push(ln)
 
-            if i_showLabels
-                string role = L.isSupport ? "S" : "R"
-                string mtfTag = L.htfHits > 0 ? " *MTF" + str.tostring(L.htfHits) : ""
-                string txt = role + " " + str.tostring(L.price, format.mintick) + " [" + str.tostring(int(L.strength)) + "]" + mtfTag
-                color labCol = L.htfHits >= 2 ? i_cConfBoost : baseCol
-                label lb = label.new(x=bar_index+5, y=L.price, text=txt, xloc=xloc.bar_index, color=color.new(labCol, 75), textcolor=labCol, style=label.style_label_left, size=size.small)
+            if i_showLbls
+                string lbl = str.tostring(lp, format.mintick) + " [" + str.tostring(lt) + "x]"
+                label lb = label.new(x=bar_index + i_lbOffset, y=lp,
+                     text=lbl,
+                     xloc=xloc.bar_index,
+                     color=color.new(col, 80),
+                     textcolor=col,
+                     style=label.style_label_left,
+                     size=size.small)
                 drawnLabels.push(lb)
 
-            if L.isSupport
+            if isSupp
                 suppCount := suppCount + 1
             else
-                resCount := resCount + 1
+                resCount  := resCount  + 1
+            drawn := drawn + 1
 
-    // 7) Status table
-    if i_showTable
-        table.clear(tStat, 0, 0, 0, 3)
-        string tfLabel = timeframe.period
-        string sym = syminfo.ticker
-        string l1 = sym + " " + tfLabel
-        string l2 = "Pivot len: " + str.tostring(pivLen)
-        string l3 = "Levels: " + str.tostring(suppCount) + "S / " + str.tostring(resCount) + "R"
-        string l4 = "Top strength: " + str.tostring(int(topStrength))
-        table.cell(tStat, 0, 0, l1, text_color=color.white,  bgcolor=color.new(color.black, 50), text_size=size.small)
-        table.cell(tStat, 0, 1, l2, text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
-        table.cell(tStat, 0, 2, l3, text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
-        table.cell(tStat, 0, 3, l4, text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
+    // -- 6. Status table ----------------------------------------
+    if i_showTbl
+        table.clear(tbl, 0, 0, 0, 4)
+        table.cell(tbl, 0, 0, syminfo.ticker + " " + timeframe.period,
+             text_color=color.white, bgcolor=color.new(color.black, 50), text_size=size.small)
+        table.cell(tbl, 0, 1, "ATR zone: " + str.tostring(zoneWidth, format.mintick),
+             text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
+        table.cell(tbl, 0, 2, "Hot zones found: " + str.tostring(numZones),
+             text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
+        table.cell(tbl, 0, 3, "Min " + str.tostring(i_minTouches) + " visits | Drawn: " + str.tostring(suppCount) + "S " + str.tostring(resCount) + "R",
+             text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
+        table.cell(tbl, 0, 4, "Extend: " + i_extMode + " | Style: " + i_lineStyl,
+             text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
 
-// ============================================================
-// ALERTS - approach/break detection vs nearest pivot
-// ============================================================
-f_nearest(bool wantSupport) =>
-    float best = na
-    if pivots.size() > 0
-        for i = 0 to pivots.size() - 1
-            p = pivots.get(i)
-            float price = p.price
-            if wantSupport and price < close
-                if na(best) or price > best
-                    best := price
-            if not wantSupport and price > close
-                if na(best) or price < best
-                    best := price
-    best
+// --------------------------------------------------------------
+// ALERTS
+// --------------------------------------------------------------
+atr14_alert = ta.atr(14)
 
-float nrSupp = f_nearest(true)
-float nrRes  = f_nearest(false)
+var float nearestSupp = na
+var float nearestRes  = na
 
-bool approachSupp = not na(nrSupp) and not na(atr20) and (close - nrSupp) <= atr20 * 0.5 and (close - nrSupp) > 0
-bool approachRes  = not na(nrRes)  and not na(atr20) and (nrRes  - close) <= atr20 * 0.5 and (nrRes  - close) > 0
-bool breakSupp    = not na(nrSupp) and close < nrSupp and close[1] >= nrSupp
-bool breakRes     = not na(nrRes)  and close > nrRes  and close[1] <= nrRes
+// Re-find nearest levels for alert logic using pivot approach
+_ph = ta.pivothigh(high, 5, 5)
+_pl = ta.pivotlow(low, 5, 5)
 
-alertcondition(approachSupp, "Approaching support",    "Price approaching nearest support level.")
-alertcondition(approachRes,  "Approaching resistance", "Price approaching nearest resistance level.")
-alertcondition(breakSupp,    "Broke support",          "Close pierced nearest support to the downside.")
-alertcondition(breakRes,     "Broke resistance",       "Close pierced nearest resistance to the upside.")
+var array<float> recentHighs = array.new<float>()
+var array<float> recentLows  = array.new<float>()
+
+if not na(_ph)
+    recentHighs.push(_ph)
+    if recentHighs.size() > 20
+        recentHighs.shift()
+if not na(_pl)
+    recentLows.push(_pl)
+    if recentLows.size() > 20
+        recentLows.shift()
+
+float _bestSupp = na
+float _bestRes  = na
+if recentLows.size() > 0
+    for i = 0 to recentLows.size() - 1
+        float p = recentLows.get(i)
+        if p < close and (na(_bestSupp) or p > _bestSupp)
+            _bestSupp := p
+if recentHighs.size() > 0
+    for i = 0 to recentHighs.size() - 1
+        float p = recentHighs.get(i)
+        if p > close and (na(_bestRes) or p < _bestRes)
+            _bestRes := p
+
+nearestSupp := _bestSupp
+nearestRes  := _bestRes
+
+bool approachSupp = not na(nearestSupp) and not na(atr14_alert) and (close - nearestSupp) <= atr14_alert * 0.5 and (close - nearestSupp) > 0
+bool approachRes  = not na(nearestRes)  and not na(atr14_alert) and (nearestRes - close)  <= atr14_alert * 0.5 and (nearestRes - close)  > 0
+bool breakSupp    = not na(nearestSupp) and close < nearestSupp and close[1] >= nearestSupp
+bool breakRes     = not na(nearestRes)  and close > nearestRes  and close[1] <= nearestRes
+
+alertcondition(approachSupp, "Approaching support",    "Price is within 0.5 ATR of nearest support.")
+alertcondition(approachRes,  "Approaching resistance", "Price is within 0.5 ATR of nearest resistance.")
+alertcondition(breakSupp,    "Broke support",          "Close just broke below nearest support.")
+alertcondition(breakRes,     "Broke resistance",       "Close just broke above nearest resistance.")
