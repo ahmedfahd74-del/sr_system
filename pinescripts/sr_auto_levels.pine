@@ -1,0 +1,307 @@
+//@version=6
+indicator("SR Auto Levels (sr_system)", "SR Auto", overlay=true, max_lines_count=30, max_labels_count=30, max_bars_back=5000)
+
+// ============================================================
+// SR AUTO LEVELS - Pine v6 native auto-detecting S/R indicator
+// ============================================================
+// Add ONCE to TradingView, works on EVERY chart you open.
+// Auto-detects support/resistance from pivot highs/lows on the
+// current timeframe AND up to 3 higher timeframes, then ranks by:
+//   - touch count
+//   - recency
+//   - multi-timeframe confluence
+// and draws the top N.
+//
+// No Python, no manual paste of levels, no per-ticker setup.
+// Switch from AMD to BTCUSDT.P to SOLUSDT.P and it just works.
+// ============================================================
+
+// ============================================================
+// TYPES
+// ============================================================
+type Pivot
+    float price
+    int   bar
+    bool  isHigh
+    int   tfRank        // 0 = current TF, 1..3 = HTF rank
+
+type Level
+    float price
+    int   touches
+    int   htfHits       // how many HTFs have a pivot near this level
+    int   firstBar
+    int   lastBar
+    bool  isSupport
+    float strength      // composite score 0..100
+
+// ============================================================
+// INPUTS
+// ============================================================
+g_det     = "Detection"
+i_autoTune     = input.bool(true, "Auto-tune pivot length", group=g_det, tooltip="Adapts pivot length to chart timeframe (intraday = tighter, daily = looser).")
+i_pivLenManual = input.int(10, "Manual pivot length", minval=2, maxval=50, group=g_det)
+i_lookback     = input.int(500, "Lookback bars", minval=50, maxval=5000, group=g_det)
+i_minTouches   = input.int(2, "Min touches per level", minval=1, maxval=10, group=g_det)
+i_zoneTolPct   = input.float(0.30, "Cluster tolerance (% of price)", minval=0.05, maxval=2.0, step=0.05, group=g_det)
+i_topN         = input.int(8, "Levels to display", minval=1, maxval=20, group=g_det)
+
+g_mtf     = "Multi-Timeframe"
+i_mtfEnable = input.bool(true, "Enable HTF anchoring", group=g_mtf)
+i_htf1      = input.timeframe("60", "HTF 1 (1H)",   group=g_mtf)
+i_htf2      = input.timeframe("240", "HTF 2 (4H)",  group=g_mtf)
+i_htf3      = input.timeframe("D", "HTF 3 (Daily)", group=g_mtf)
+
+g_score   = "Scoring weights (relative)"
+i_wTouches = input.float(0.40, "Touches weight",        minval=0, maxval=1, step=0.05, group=g_score)
+i_wRecency = input.float(0.20, "Recency weight",        minval=0, maxval=1, step=0.05, group=g_score)
+i_wHTF     = input.float(0.40, "HTF confluence weight", minval=0, maxval=1, step=0.05, group=g_score)
+
+g_style   = "Style"
+i_cSupp        = input.color(color.new(#00C853, 0), "Support color",    group=g_style)
+i_cRes         = input.color(color.new(#FF1744, 0), "Resistance color", group=g_style)
+i_cConfBoost   = input.color(color.new(#FFD600, 0), "MTF confluence highlight", group=g_style, tooltip="Levels with HTF confluence borrow this color tint for the label.")
+i_lwBase       = input.int(1, "Base line width", minval=1, maxval=4, group=g_style)
+i_lwMax        = input.int(3, "Max  line width", minval=1, maxval=4, group=g_style)
+i_showLabels   = input.bool(true, "Show level labels", group=g_style)
+i_extendLines  = input.bool(true, "Extend lines to right edge", group=g_style)
+
+g_table   = "Status Table"
+i_showTable = input.bool(true, "Show status table (top right)", group=g_table)
+
+// ============================================================
+// AUTO-TUNE
+// ============================================================
+tfMin = timeframe.in_seconds() / 60
+pivLenAuto = tfMin <= 5 ? 12 : tfMin <= 60 ? 10 : tfMin <= 240 ? 8 : 6
+pivLen = i_autoTune ? pivLenAuto : i_pivLenManual
+
+atr20 = ta.atr(20)
+
+// ============================================================
+// PIVOT DETECTION (current TF)
+// ============================================================
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,   pivLen, pivLen)
+
+// ============================================================
+// HTF PIVOT BUNDLE (one security call per HTF)
+// ============================================================
+f_htfBundle(simple int n) =>
+    [ta.pivothigh(high, n, n), ta.pivotlow(low, n, n)]
+
+[h1Ph, h1Pl] = request.security(syminfo.tickerid, i_htf1, f_htfBundle(pivLen), lookahead=barmerge.lookahead_off)
+[h2Ph, h2Pl] = request.security(syminfo.tickerid, i_htf2, f_htfBundle(pivLen), lookahead=barmerge.lookahead_off)
+[h3Ph, h3Pl] = request.security(syminfo.tickerid, i_htf3, f_htfBundle(pivLen), lookahead=barmerge.lookahead_off)
+
+// ============================================================
+// ACCUMULATE PIVOTS
+// ============================================================
+var array<Pivot> pivots = array.new<Pivot>()
+
+// Dedup state for HTF pivots (HTF prints repeat across many bars)
+var float lh1p = na
+var float lh1l = na
+var float lh2p = na
+var float lh2l = na
+var float lh3p = na
+var float lh3l = na
+
+if not na(ph)
+    pivots.push(Pivot.new(price=ph, bar=bar_index-pivLen, isHigh=true,  tfRank=0))
+if not na(pl)
+    pivots.push(Pivot.new(price=pl, bar=bar_index-pivLen, isHigh=false, tfRank=0))
+
+if i_mtfEnable
+    if not na(h1Ph) and h1Ph != lh1p
+        pivots.push(Pivot.new(price=h1Ph, bar=bar_index, isHigh=true,  tfRank=1))
+        lh1p := h1Ph
+    if not na(h1Pl) and h1Pl != lh1l
+        pivots.push(Pivot.new(price=h1Pl, bar=bar_index, isHigh=false, tfRank=1))
+        lh1l := h1Pl
+    if not na(h2Ph) and h2Ph != lh2p
+        pivots.push(Pivot.new(price=h2Ph, bar=bar_index, isHigh=true,  tfRank=2))
+        lh2p := h2Ph
+    if not na(h2Pl) and h2Pl != lh2l
+        pivots.push(Pivot.new(price=h2Pl, bar=bar_index, isHigh=false, tfRank=2))
+        lh2l := h2Pl
+    if not na(h3Ph) and h3Ph != lh3p
+        pivots.push(Pivot.new(price=h3Ph, bar=bar_index, isHigh=true,  tfRank=3))
+        lh3p := h3Ph
+    if not na(h3Pl) and h3Pl != lh3l
+        pivots.push(Pivot.new(price=h3Pl, bar=bar_index, isHigh=false, tfRank=3))
+        lh3l := h3Pl
+
+// Cap memory so long history never blows up.
+if pivots.size() > 5000
+    pivots.shift()
+
+// ============================================================
+// DRAWING STATE
+// ============================================================
+var array<line>  drawnLines  = array.new<line>()
+var array<label> drawnLabels = array.new<label>()
+var table tStat = table.new(position.top_right, 1, 4, frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+
+// ============================================================
+// PROCESS & DRAW (last bar only)
+// ============================================================
+if barstate.islast
+
+    for ln in drawnLines
+        line.delete(ln)
+    drawnLines.clear()
+    for lb in drawnLabels
+        label.delete(lb)
+    drawnLabels.clear()
+
+    // 1) Filter pivots to lookback window
+    int cutoff = bar_index - i_lookback
+    array<Pivot> raw = array.new<Pivot>()
+    if pivots.size() > 0
+        for i = 0 to pivots.size() - 1
+            p = pivots.get(i)
+            if p.bar >= cutoff
+                raw.push(p)
+
+    // 2) Cluster pivots into levels
+    array<Level> levels = array.new<Level>()
+    float zone = close * i_zoneTolPct / 100.0
+
+    if raw.size() > 0
+        for i = 0 to raw.size() - 1
+            p = raw.get(i)
+            bool merged = false
+            int lN = levels.size()
+            if lN > 0
+                for j = 0 to lN - 1
+                    L = levels.get(j)
+                    if math.abs(p.price - L.price) <= zone
+                        int t = L.touches
+                        L.price    := (L.price * t + p.price) / (t + 1)
+                        L.touches  := t + 1
+                        if p.tfRank > 0
+                            L.htfHits := L.htfHits + 1
+                        L.firstBar := math.min(L.firstBar, p.bar)
+                        L.lastBar  := math.max(L.lastBar,  p.bar)
+                        merged := true
+                        break
+            if not merged
+                levels.push(Level.new(
+                     price     = p.price,
+                     touches   = 1,
+                     htfHits   = p.tfRank > 0 ? 1 : 0,
+                     firstBar  = p.bar,
+                     lastBar   = p.bar,
+                     isSupport = p.price <= close,
+                     strength  = 0.0))
+
+    // 3) Score each level
+    if levels.size() > 0
+        for i = 0 to levels.size() - 1
+            L = levels.get(i)
+            float touchScore   = math.min(100.0, float(L.touches) * 12.0)
+            float age          = math.max(1.0, float(bar_index - L.lastBar))
+            float recencyScore = 100.0 / (1.0 + age / 200.0)
+            float htfScore     = math.min(100.0, float(L.htfHits) * 35.0)
+            float wSum = math.max(0.0001, i_wTouches + i_wRecency + i_wHTF)
+            L.strength := (touchScore * i_wTouches + recencyScore * i_wRecency + htfScore * i_wHTF) / wSum
+            L.isSupport := L.price <= close
+
+    // 4) Filter by min touches
+    array<Level> filtered = array.new<Level>()
+    if levels.size() > 0
+        for i = 0 to levels.size() - 1
+            L = levels.get(i)
+            if L.touches >= i_minTouches
+                filtered.push(L)
+
+    // 5) Sort by strength desc
+    int sz = filtered.size()
+    if sz > 1
+        for i = 0 to sz - 2
+            int maxIdx = i
+            for j = i + 1 to sz - 1
+                if filtered.get(j).strength > filtered.get(maxIdx).strength
+                    maxIdx := j
+            if maxIdx != i
+                Level tmp = filtered.get(i)
+                filtered.set(i, filtered.get(maxIdx))
+                filtered.set(maxIdx, tmp)
+
+    // 6) Draw top N
+    int topN = math.min(i_topN, filtered.size())
+    int suppCount = 0
+    int resCount = 0
+    float topStrength = topN > 0 ? filtered.get(0).strength : 0.0
+
+    if topN > 0
+        for i = 0 to topN - 1
+            L = filtered.get(i)
+            color baseCol = L.isSupport ? i_cSupp : i_cRes
+            float ratio = topStrength > 0 ? L.strength / topStrength : 0.0
+            int width = i_lwBase + int(math.floor(ratio * (i_lwMax - i_lwBase)))
+            width := math.max(i_lwBase, math.min(i_lwMax, width))
+
+            int x1 = math.max(L.firstBar, bar_index - i_lookback)
+            int x2 = bar_index + (i_extendLines ? 30 : 1)
+            extend ext = i_extendLines ? extend.right : extend.none
+
+            line ln = line.new(x1=x1, y1=L.price, x2=x2, y2=L.price, xloc=xloc.bar_index, extend=ext, color=baseCol, width=width, style=line.style_solid)
+            drawnLines.push(ln)
+
+            if i_showLabels
+                string role = L.isSupport ? "S" : "R"
+                string mtfTag = L.htfHits > 0 ? " *MTF" + str.tostring(L.htfHits) : ""
+                string txt = role + " " + str.tostring(L.price, format.mintick) + " [" + str.tostring(int(L.strength)) + "]" + mtfTag
+                color labCol = L.htfHits >= 2 ? i_cConfBoost : baseCol
+                label lb = label.new(x=bar_index+5, y=L.price, text=txt, xloc=xloc.bar_index, color=color.new(labCol, 75), textcolor=labCol, style=label.style_label_left, size=size.small)
+                drawnLabels.push(lb)
+
+            if L.isSupport
+                suppCount := suppCount + 1
+            else
+                resCount := resCount + 1
+
+    // 7) Status table
+    if i_showTable
+        table.clear(tStat, 0, 0, 0, 3)
+        string tfLabel = timeframe.period
+        string sym = syminfo.ticker
+        string l1 = sym + " " + tfLabel
+        string l2 = "Pivot len: " + str.tostring(pivLen)
+        string l3 = "Levels: " + str.tostring(suppCount) + "S / " + str.tostring(resCount) + "R"
+        string l4 = "Top strength: " + str.tostring(int(topStrength))
+        table.cell(tStat, 0, 0, l1, text_color=color.white,  bgcolor=color.new(color.black, 50), text_size=size.small)
+        table.cell(tStat, 0, 1, l2, text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
+        table.cell(tStat, 0, 2, l3, text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
+        table.cell(tStat, 0, 3, l4, text_color=color.silver, bgcolor=color.new(color.black, 80), text_size=size.small)
+
+// ============================================================
+// ALERTS - approach/break detection vs nearest pivot
+// ============================================================
+f_nearest(bool wantSupport) =>
+    float best = na
+    if pivots.size() > 0
+        for i = 0 to pivots.size() - 1
+            p = pivots.get(i)
+            float price = p.price
+            if wantSupport and price < close
+                if na(best) or price > best
+                    best := price
+            if not wantSupport and price > close
+                if na(best) or price < best
+                    best := price
+    best
+
+float nrSupp = f_nearest(true)
+float nrRes  = f_nearest(false)
+
+bool approachSupp = not na(nrSupp) and not na(atr20) and (close - nrSupp) <= atr20 * 0.5 and (close - nrSupp) > 0
+bool approachRes  = not na(nrRes)  and not na(atr20) and (nrRes  - close) <= atr20 * 0.5 and (nrRes  - close) > 0
+bool breakSupp    = not na(nrSupp) and close < nrSupp and close[1] >= nrSupp
+bool breakRes     = not na(nrRes)  and close > nrRes  and close[1] <= nrRes
+
+alertcondition(approachSupp, "Approaching support",    "Price approaching nearest support level.")
+alertcondition(approachRes,  "Approaching resistance", "Price approaching nearest resistance level.")
+alertcondition(breakSupp,    "Broke support",          "Close pierced nearest support to the downside.")
+alertcondition(breakRes,     "Broke resistance",       "Close pierced nearest resistance to the upside.")
