@@ -1,0 +1,596 @@
+//@version=6
+// ============================================================================
+// SR PRO V5 - INSTITUTIONAL CONFIRMATION PIPELINE
+// Multi-Asset | MTF | Liquidity-First | Checklist-Driven
+// ============================================================================
+// CONFIRMATION PIPELINE:
+//   Phase A: Market Phase - Accumulation, Distribution, Manipulation, Trend, Range
+//   Phase B: Liquidity Sweep - Equal highs/lows, old highs/lows, double tests
+//   Phase C: Final Confirmations (8 checks)
+//     1. FVG    2. iFVG    3. OB    4. Candle Pattern
+//     5. Structure BOS/CHOCH    6. Volume    7. Efficiency    8. Session
+//   DASHBOARD: Bias, sweep status, checklist, entry/SL/TP
+// ============================================================================
+indicator("SR PRO V5 - Confirmation Pipeline",
+     shorttitle="SR PRO V5", overlay=true,
+     max_lines_count=100, max_labels_count=100, max_boxes_count=50)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+string G_CTX = "1. Market"
+string G_SGN = "5. Confirmation"
+string G_EXE = "6. Execution"
+string G_RSK = "7. Risk"
+string G_VIS = "8. Display"
+
+bool   i_ctx_enable   = input.bool(true, "Enable Market Context", group=G_CTX)
+string i_mkt_override = input.string("Auto", "Market Type",
+     options=["Auto","Forex","Crypto","Index","Commodity","Equity"], group=G_CTX)
+int    i_st_piv_len   = input.int(5, "Structure Pivot Length", minval=3, maxval=20, group=G_CTX)
+int    i_lq_mem       = input.int(10, "Sweep Memory (bars)", minval=3, maxval=50, group=G_CTX)
+
+float  i_sg_min_score = input.float(70.0, "Min Trade Score", minval=50, maxval=95, step=5, group=G_SGN)
+bool   i_cn_fvg       = input.bool(true,  "Confirm: FVG",             group=G_SGN)
+bool   i_cn_ifvg      = input.bool(true,  "Confirm: iFVG",            group=G_SGN)
+bool   i_cn_ob        = input.bool(true,  "Confirm: Order Block",     group=G_SGN)
+bool   i_cn_candle    = input.bool(true,  "Confirm: Candle Pattern",  group=G_SGN)
+bool   i_cn_struct    = input.bool(true,  "Confirm: Structure Break", group=G_SGN)
+bool   i_cn_volume    = input.bool(true,  "Confirm: Volume Spike",    group=G_SGN)
+bool   i_cn_eff       = input.bool(true,  "Confirm: Efficiency",      group=G_SGN)
+bool   i_cn_session   = input.bool(true,  "Confirm: Session Quality", group=G_SGN)
+int    i_cn_min_check = input.int(5, "Minimum Confirmations", minval=3, maxval=9, group=G_SGN)
+
+float  i_ex_sl_atr = input.float(1.5, "Stop Loss (x ATR)", minval=0.5, maxval=5.0, step=0.25, group=G_EXE)
+float  i_ex_tp1    = input.float(1.5, "TP1 R:R", minval=0.5, maxval=5.0,  step=0.25, group=G_EXE)
+float  i_ex_tp2    = input.float(2.5, "TP2 R:R", minval=1.0, maxval=10.0, step=0.5,  group=G_EXE)
+float  i_ex_tp3    = input.float(4.0, "TP3 R:R", minval=1.0, maxval=15.0, step=0.5,  group=G_EXE)
+
+bool   i_vis_dash = input.bool(true, "Show Dashboard", group=G_VIS)
+color  i_vis_bg   = input.color(color.new(#08081A, 90), "Dashboard BG", group=G_VIS)
+
+
+// ============================================================================
+// CORE UTILITIES
+// ============================================================================
+// FIX: f_get_atr needs 'simple string' qualifier for the tf argument
+f_get_atr(simple string tf, simple int len) =>
+    request.security(syminfo.tickerid, tf, ta.atr(len), lookahead=barmerge.lookahead_off)
+
+// FIX: f_fmt - use format.mintick for clean price formatting, fallback for integers
+f_fmt(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+f_pct_dist(float a, float b) =>
+    na(a) or na(b) ? 999.0 : math.abs(a - b) / math.max(math.abs(b), syminfo.mintick * 10) * 100.0
+
+f_efficiency_ratio(int p) =>
+    _m = math.abs(close - close[p])
+    _n = 0.0
+    for _i = 0 to p - 1
+        _n += math.abs(close[_i] - close[_i + 1])
+    _n > 0 ? _m / _n : 0.0
+
+// FIX: f_mkt_type - ternary chain is valid Pine v6 (no inline if/else keyword issues)
+f_mkt_type() =>
+    _o = str.lower(i_mkt_override)
+    _o != "auto" ? _o :
+     syminfo.type == "forex"   ? "forex"     :
+     syminfo.type == "crypto"  ? "crypto"    :
+     (syminfo.type == "futures" or syminfo.type == "index") ? "index" :
+     syminfo.type == "cfd"     ? "commodity" : "equity"
+
+// FIX: session uses simple ternary chain - valid Pine v6
+f_session() =>
+    _t = hour(time("60"), syminfo.timezone) * 60 + minute(time("60"), syminfo.timezone)
+    _t >= 60 and _t < 480  ? "Asian"  :
+     _t >= 480 and _t < 840 ? "London" :
+     _t >= 840 and _t < 1200? "NY"     :
+     _t >= 1200              ? "NY PM"  : "Closed"
+
+var string MKT_TYPE = ""
+var string CUR_SESS = "24/5"
+
+if barstate.isfirst
+    MKT_TYPE := f_mkt_type()
+
+float ATR_D  = nz(f_get_atr("D",   14), ta.atr(14))
+float ATR_4H = nz(f_get_atr("240", 14), ta.atr(14))
+float ATR_1H = nz(f_get_atr("60",  14), ta.atr(14))
+CUR_SESS := f_session()
+
+
+// ============================================================================
+// PHASE A: MARKET PHASE DETECTION
+// FIX: CE10088 - cannot modify global vars inside functions.
+// Solution: function returns a tuple; caller assigns to globals.
+// ============================================================================
+var string PA_STATE     = "unknown"
+var string PA_BIAS      = "neutral"
+var int    PA_CONFIRMED = 0
+var int    PA_TOTAL     = 0
+
+f_phase_a() =>
+    _atr     = ta.atr(14)
+    _atr_sma = nz(ta.sma(_atr, 20), _atr)
+    _vol     = nz(volume, 0.0)
+    _vol_sma = nz(ta.sma(_vol, 20), 1.0)
+    _er      = f_efficiency_ratio(14)
+    _vr      = _atr_sma > 0 ? _atr / _atr_sma : 1.0
+    _s50     = close / nz(ta.sma(close, 50), close) - 1.0
+    _s20     = close / nz(ta.sma(close, 20), close) - 1.0
+
+    _st  = "ranging"
+    _bi  = "neutral"
+    _c   = 0
+    _ch  = 0
+
+    _ch += 1
+    if _vr > 1.8
+        _st := "chaotic"
+    else if _vr > 1.3 and _er > 0.35
+        _st := "trending"
+    else if _vr < 0.7
+        _st := "contracting"
+
+    _ch += 1
+    if _er > 0.35 and _st != "chaotic"
+        _c += 1
+
+    _ch += 1
+    if _s50 > 0.03
+        _bi := "bull"
+        _c  += 1
+    else if _s50 < -0.03
+        _bi := "bear"
+        _c  += 1
+
+    _ch += 1
+    if (_s20 > 0 and _s50 > 0) or (_s20 < 0 and _s50 < 0)
+        _c += 1
+
+    _ch += 1
+    if _st == "ranging" and _vol > _vol_sma * 1.3 and _bi == "bull" and _s20 > -0.01
+        _st := "accumulation"
+        _c  += 1
+
+    _ch += 1
+    if _st == "ranging" and _vol > _vol_sma * 1.3 and _bi == "bear" and _s20 < 0.01
+        _st := "distribution"
+        _c  += 1
+
+    _ch += 1
+    _wu  = high - math.max(open, close)
+    _wd  = math.min(open, close) - low
+    _bod = math.abs(close - open)
+    if _bod > 0 and (_wu > _bod * 0.7 or _wd > _bod * 0.7) and _vol > _vol_sma * 1.2
+        _st := "manipulation"
+        _c  += 1
+
+    _ch += 1
+    if (high - low) / math.max(low, syminfo.mintick) * 100.0 < 0.05
+        _st := "low_liquidity"
+        _c  := 0
+
+    [_st, _bi, _c, _ch]
+
+[PA_STATE, PA_BIAS, PA_CONFIRMED, PA_TOTAL] = f_phase_a()
+
+
+// ============================================================================
+// PHASE B: LIQUIDITY SWEEP DETECTION
+// FIX: same CE10088 pattern - return tuple, assign at call site
+// ============================================================================
+var bool   PB_SWEPT  = false
+var string PB_DIR    = "none"
+var float  PB_DEPTH  = 0.0
+var string PB_TYPE   = "none"
+var int    PB_CONF   = 0
+var int    PB_TOTAL  = 0
+
+f_phase_b() =>
+    _len  = i_lq_mem
+    _sw_h = ta.pivothigh(high, i_st_piv_len, i_st_piv_len)
+    _sw_l = ta.pivotlow(low,  i_st_piv_len, i_st_piv_len)
+
+    _sw  = false
+    _dir = "none"
+    _dep = 0.0
+    _typ = "none"
+    _c   = 0
+    _ch  = 0
+
+    _ch += 1
+    if not na(_sw_h) and high > _sw_h
+        _sw  := true
+        _dir := "short"
+        _dep := high - _sw_h
+        _typ := "swing_high"
+        _c   += 1
+
+    _ch += 1
+    if not na(_sw_l) and low < _sw_l
+        _sw  := true
+        _dir := "long"
+        _dep := _sw_l - low
+        _typ := _typ == "swing_high" ? "both" : "swing_low"
+        _c   += 1
+
+    _eqh_cnt = 0
+    _eqh_p   = 0.0
+    _eql_cnt = 0
+    _eql_p   = 0.0
+
+    _ch += 1
+    for _i = 0 to _len
+        for _j = _i + 1 to _len
+            if not na(high[_i]) and not na(high[_j])
+                if math.abs(high[_i] - high[_j]) / math.max(high[_i], syminfo.mintick) < 0.0005
+                    _eqh_cnt += 1
+                    _eqh_p   := high[_i]
+    if _eqh_cnt >= 2 and high > _eqh_p
+        _sw  := true
+        _dir := "short"
+        _typ := _typ == "both" ? "both" : "equal_highs"
+        _c   += 1
+
+    _ch += 1
+    for _i = 0 to _len
+        for _j = _i + 1 to _len
+            if not na(low[_i]) and not na(low[_j])
+                if math.abs(low[_i] - low[_j]) / math.max(low[_i], syminfo.mintick) < 0.0005
+                    _eql_cnt += 1
+                    _eql_p   := low[_i]
+    if _eql_cnt >= 2 and low < _eql_p
+        _sw  := true
+        _dir := "long"
+        _typ := _typ == "both" ? "both" : "equal_lows"
+        _c   += 1
+
+    _ch += 1
+    if _sw
+        _reclaim = (_dir == "long" and close > _eql_p) or (_dir == "short" and close < _eqh_p)
+        if _reclaim
+            _c   += 1
+            _typ := _typ + "_reclaim"
+
+    [_sw, _dir, _dep, _typ, _c, _ch]
+
+[PB_SWEPT, PB_DIR, PB_DEPTH, PB_TYPE, PB_CONF, PB_TOTAL] = f_phase_b()
+
+
+// ============================================================================
+// PHASE C: FINAL CONFIRMATIONS
+// FIX: same CE10088 pattern - return tuple
+// ============================================================================
+var bool   CN_FVG     = false
+var string CN_FVG_D   = "none"
+var bool   CN_IFVG    = false
+var string CN_IFVG_D  = "none"
+var bool   CN_OB      = false
+var string CN_OB_D    = "none"
+var bool   CN_CANDLE  = false
+var string CN_CDL_T   = "none"
+var bool   CN_STRUCT  = false
+var string CN_STR_D   = "none"
+var bool   CN_VOL     = false
+var bool   CN_EFF     = false
+var bool   CN_SESS    = false
+var string CN_DIR     = "none"
+var int    CN_PASS    = 0
+var int    CN_CHECKS  = 0
+
+f_phase_c() =>
+    _fvg=false   _fd="none"
+    _ifvg=false  _id="none"
+    _ob=false    _od="none"
+    _cdl=false   _ct="none"
+    _str=false   _sd="none"
+    _vol=false   _eff=false   _sess=false
+    _pass=0      _checks=0
+
+    // 1. FVG
+    _checks += 1
+    if i_cn_fvg
+        if not na(low[1]) and not na(high[2]) and low[1] > high[2]
+            _fvg:=true  _fd:="bull"  _pass+=1
+        if not na(high[1]) and not na(low[2]) and high[1] < low[2]
+            _fvg:=true  _fd:="bear"  _pass+=1
+
+    // 2. iFVG
+    _checks += 1
+    if i_cn_ifvg
+        if not na(low[2]) and not na(high[3]) and low[2] > high[3]
+            if close >= high[3] and close <= low[2]
+                _ifvg:=true  _id:="bull"  _pass+=1
+        if not na(high[2]) and not na(low[3]) and high[2] < low[3]
+            if close >= high[2] and close <= low[3]
+                _ifvg:=true  _id:="bear"  _pass+=1
+
+    // 3. Order Block
+    _checks += 1
+    if i_cn_ob
+        if close > close[1] and close[1] > close[2] and close[2] > close[3] and close[3] < open[3]
+            _ob:=true  _od:="bull"  _pass+=1
+        if close < close[1] and close[1] < close[2] and close[2] < close[3] and close[3] > open[3]
+            _ob:=true  _od:="bear"  _pass+=1
+
+    // 4. Candle Pattern
+    _checks += 1
+    if i_cn_candle
+        _body  = math.abs(close - open)
+        _range = math.max(high - low, syminfo.mintick)
+        _upper = high - math.max(open, close)
+        _lower = math.min(open, close) - low
+        if close[1] < open[1] and close > open and close > open[1] and open < close[1]
+            _cdl:=true  _ct:="bull_engulf"  _pass+=1
+        else if close[1] > open[1] and close < open and close < open[1] and open > close[1]
+            _cdl:=true  _ct:="bear_engulf"  _pass+=1
+        else if _body < _range * 0.3 and _lower > _body * 2 and close > (high + low) / 2
+            _cdl:=true  _ct:="bull_pin"  _pass+=1
+        else if _body < _range * 0.3 and _upper > _body * 2 and close < (high + low) / 2
+            _cdl:=true  _ct:="bear_pin"  _pass+=1
+
+    // 5. Structure Break
+    _checks += 1
+    if i_cn_struct
+        _ph = ta.pivothigh(high, i_st_piv_len, i_st_piv_len)
+        _pl = ta.pivotlow(low,  i_st_piv_len, i_st_piv_len)
+        if not na(_ph) and high > ta.valuewhen(not na(_ph), _ph, 1)
+            _str:=true  _sd:="bull"  _pass+=1
+        if not na(_pl) and low < ta.valuewhen(not na(_pl), _pl, 1)
+            _str:=true  _sd:="bear"  _pass+=1
+
+    // 6. Volume
+    _checks += 1
+    if i_cn_volume
+        _vc = nz(volume, 0.0)
+        _va = nz(ta.sma(_vc, 20), 1.0)
+        if _va > 0 and _vc > _va * 1.3
+            _vol:=true  _pass+=1
+
+    // 7. Efficiency
+    _checks += 1
+    if i_cn_eff
+        _er = f_efficiency_ratio(14)
+        if _er > 0.3
+            _eff:=true  _pass+=1
+        else if _er > 0.2
+            _pass+=1
+
+    // 8. Session
+    _checks += 1
+    if i_cn_session
+        if CUR_SESS == "London" or CUR_SESS == "NY"
+            _sess:=true  _pass+=1
+        else if CUR_SESS == "Asian"
+            _pass+=1
+
+    // Aggregate direction
+    _bulls = 0
+    _bears = 0
+    if _fd   == "bull"
+        _bulls+=1
+    if _fd   == "bear"
+        _bears+=1
+    if _id   == "bull"
+        _bulls+=1
+    if _id   == "bear"
+        _bears+=1
+    if _od   == "bull"
+        _bulls+=1
+    if _od   == "bear"
+        _bears+=1
+    if _sd   == "bull"
+        _bulls+=1
+    if _sd   == "bear"
+        _bears+=1
+    if _ct   == "bull_engulf" or _ct == "bull_pin"
+        _bulls+=1
+    if _ct   == "bear_engulf" or _ct == "bear_pin"
+        _bears+=1
+    if PB_DIR == "long" 
+        _bulls+=1
+    if PB_DIR == "short"
+        _bears+=1
+    _dir = _bulls > _bears ? "long" : _bears > _bulls ? "short" : "none"
+
+    [_fvg,_fd, _ifvg,_id, _ob,_od, _cdl,_ct, _str,_sd, _vol,_eff,_sess, _dir, _pass, _checks]
+
+[CN_FVG,CN_FVG_D, CN_IFVG,CN_IFVG_D, CN_OB,CN_OB_D,
+ CN_CANDLE,CN_CDL_T, CN_STRUCT,CN_STR_D,
+ CN_VOL,CN_EFF,CN_SESS, CN_DIR, CN_PASS, CN_CHECKS] = f_phase_c()
+
+
+// ============================================================================
+// ENTRY / STOP / TARGET
+// FIX: same CE10088 - return tuple
+// ============================================================================
+var float  EP    = float(na)
+var float  SL    = float(na)
+var float  TP1   = float(na)
+var float  TP2   = float(na)
+var float  TP3   = float(na)
+var string T_DIR = "none"
+var float  T_SCR = 0.0
+var string T_GRD = "none"
+var bool   T_VLD = false
+
+f_calc_entry() =>
+    _atr   = ta.atr(14)
+    _dir   = CN_DIR
+    _entry = float(na)
+    _sl    = float(na)
+    _tp1   = float(na)
+    _tp2   = float(na)
+    _tp3   = float(na)
+    _score = 0.0
+    _grade = "none"
+    _valid = false
+
+    _ok = CN_PASS >= i_cn_min_check and PA_STATE != "chaotic" and PA_STATE != "low_liquidity"
+
+    if _ok and _dir != "none"
+        _base  = float(CN_PASS) / float(math.max(CN_CHECKS, 1)) * 50.0
+        _bA    = PA_CONFIRMED > PA_TOTAL / 2 ? 15.0 : 5.0
+        _bB    = PB_SWEPT ? 20.0 : 0.0
+        _bD    = PB_DEPTH > 0 and _atr > 0 ? math.min(10.0, PB_DEPTH / _atr * 10.0) : 0.0
+        _score := math.min(100.0, _base + _bA + _bB + _bD)
+
+        if _score >= 90.0
+            _grade := "A+"
+        else if _score >= 80.0
+            _grade := "INSTITUTIONAL"
+        else if _score >= 70.0
+            _grade := "AGGRESSIVE"
+        else
+            _grade := "WATCHLIST"
+
+        _entry := close
+        if _dir == "long"
+            _sl := low - _atr * i_ex_sl_atr * 0.5
+            if PB_SWEPT and PB_DIR == "long"
+                _sl := math.min(_sl, low - _atr * 0.3)
+        else
+            _sl := high + _atr * i_ex_sl_atr * 0.5
+            if PB_SWEPT and PB_DIR == "short"
+                _sl := math.max(_sl, high + _atr * 0.3)
+
+        _risk = math.abs(_entry - _sl)
+        if _risk > 0
+            _tp1 := _dir == "long" ? _entry + _risk * i_ex_tp1 : _entry - _risk * i_ex_tp1
+            _tp2 := _dir == "long" ? _entry + _risk * i_ex_tp2 : _entry - _risk * i_ex_tp2
+            _tp3 := _dir == "long" ? _entry + _risk * i_ex_tp3 : _entry - _risk * i_ex_tp3
+        _valid := true
+
+    [_entry, _sl, _tp1, _tp2, _tp3, _dir, _score, _grade, _valid]
+
+[EP, SL, TP1, TP2, TP3, T_DIR, T_SCR, T_GRD, T_VLD] = f_calc_entry()
+
+
+// ============================================================================
+// DASHBOARD
+// FIX: 'var table _d = na' inside a function is illegal in Pine v6.
+// Solution: declare table at module level, draw in barstate.islast block.
+// ============================================================================
+var table _d = na
+
+if i_vis_dash and na(_d)
+    _d := table.new(position.top_right, 2, 18,
+         bgcolor=i_vis_bg, border_color=color.new(#2A2A5A, 50),
+         border_width=1, frame_width=1)
+
+if barstate.islast and i_vis_dash and not na(_d)
+
+    color _tc  = color.new(#CCCCDD, 0)
+    color _bg  = color.new(#08081A, 90)
+    color _bh  = color.new(#12123A, 85)
+    color _gr  = color.new(#26A69A, 0)
+    color _rd  = color.new(#EF5350, 0)
+    color _yl  = color.new(#FFD600, 0)
+    color _or  = color.new(#FF9800, 0)
+    color _dim = color.new(#555577, 0)
+
+    int _r = 0
+
+    table.cell(_d, 0, _r, "SR PRO V5",  text_color=color.new(#E0E0FF,0), text_size=size.small, bgcolor=_bh)
+    table.cell(_d, 1, _r, MKT_TYPE,     text_color=color.new(#666688,0), text_size=size.small, bgcolor=_bh)
+
+    _r += 1
+    color _pc = PA_STATE=="trending" or PA_STATE=="accumulation" ? _gr :
+         PA_STATE=="distribution" or PA_STATE=="chaotic" ? _rd :
+         PA_STATE=="manipulation" ? _or :
+         PA_STATE=="low_liquidity" ? _dim : _yl
+    table.cell(_d, 0, _r, "Market Phase", text_color=_tc,  text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, PA_STATE,       text_color=_pc,  text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    table.cell(_d, 0, _r, "Bias",   text_color=_tc, text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, PA_BIAS,  text_color=PA_BIAS=="bull" ? _gr : PA_BIAS=="bear" ? _rd : _dim, text_size=size.tiny, bgcolor=_bh)
+
+    _r += 1
+    table.cell(_d, 0, _r, "Session",  text_color=_tc, text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, CUR_SESS,   text_color=color.new(#80CBC4,0), text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    table.cell(_d, 0, _r, "Liq Sweep",   text_color=_tc, text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, PB_SWEPT ? "YES " + PB_DIR : "NO",
+         text_color=PB_SWEPT ? _or : _dim, text_size=size.tiny, bgcolor=_bh)
+
+    _r += 1
+    table.cell(_d, 0, _r, "Sweep Type", text_color=_tc, text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, PB_TYPE,      text_color=color.new(#80CBC4,0), text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    string _pct = CN_CHECKS > 0 ? str.tostring(math.round(float(CN_PASS)/float(CN_CHECKS)*100.0,0)) + "%" : "-"
+    table.cell(_d, 0, _r, "CONFIRMATIONS", text_color=color.new(#E0E0FF,0), text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, str.tostring(CN_PASS)+"/"+str.tostring(CN_CHECKS)+" "+_pct,
+         text_color=CN_PASS >= i_cn_min_check ? _gr : _rd, text_size=size.tiny, bgcolor=_bh)
+
+    _r += 1
+    table.cell(_d, 0, _r, CN_FVG  ? "FVG "+CN_FVG_D  : "FVG --",  text_color=CN_FVG  ? _gr : _dim, text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, CN_IFVG ? "iFVG "+CN_IFVG_D : "iFVG --", text_color=CN_IFVG ? _gr : _dim, text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    table.cell(_d, 0, _r, CN_OB     ? "OB "+CN_OB_D    : "OB --",     text_color=CN_OB     ? _gr : _dim, text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, CN_CANDLE ? CN_CDL_T          : "Candle --", text_color=CN_CANDLE ? _gr : _dim, text_size=size.tiny, bgcolor=_bh)
+
+    _r += 1
+    table.cell(_d, 0, _r, CN_STRUCT ? "BOS "+CN_STR_D : "BOS --", text_color=CN_STRUCT ? _gr : _dim, text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, CN_VOL    ? "VOL"            : "VOL --", text_color=CN_VOL    ? _gr : _dim, text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    table.cell(_d, 0, _r, CN_EFF  ? "EFF"  : "EFF --",  text_color=CN_EFF  ? _gr : _dim, text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, CN_SESS ? "SESS" : "SESS --", text_color=CN_SESS ? _gr : _dim, text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    color _tc2 = T_GRD=="A+" ? _gr : T_GRD=="INSTITUTIONAL" ? _yl : T_GRD=="AGGRESSIVE" ? _or : T_GRD=="WATCHLIST" ? color.new(#4488FF,0) : _dim
+    table.cell(_d, 0, _r, "TRADE", text_color=color.new(#E0E0FF,0), text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, T_VLD ? T_DIR+" "+T_GRD : "NO TRADE", text_color=_tc2, text_size=size.tiny, bgcolor=_bh)
+
+    _r += 1
+    color _sc = T_SCR >= 90 ? _gr : T_SCR >= 80 ? _yl : T_SCR >= 70 ? _or : _dim
+    table.cell(_d, 0, _r, "Score",                    text_color=_tc, text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, str.tostring(math.round(T_SCR, 0)), text_color=_sc, text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    table.cell(_d, 0, _r, "ENTRY", text_color=_tc,                     text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, f_fmt(EP), text_color=color.new(#80CBC4,0), text_size=size.tiny, bgcolor=_bh)
+
+    _r += 1
+    table.cell(_d, 0, _r, "SL",     text_color=_rd,        text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, f_fmt(SL), text_color=_rd,       text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    table.cell(_d, 0, _r, "TP1",     text_color=_gr,         text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, f_fmt(TP1), text_color=_gr,        text_size=size.tiny, bgcolor=_bh)
+
+    _r += 1
+    table.cell(_d, 0, _r, "TP2",     text_color=_yl,         text_size=size.tiny, bgcolor=_bg)
+    table.cell(_d, 1, _r, f_fmt(TP2), text_color=_yl,        text_size=size.tiny, bgcolor=_bg)
+
+    _r += 1
+    table.cell(_d, 0, _r, "TP3",     text_color=_or,         text_size=size.tiny, bgcolor=_bh)
+    table.cell(_d, 1, _r, f_fmt(TP3), text_color=_or,        text_size=size.tiny, bgcolor=_bh)
+
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+if T_VLD
+    string _msg = T_DIR + " " + T_GRD +
+         " | Score: "   + str.tostring(math.round(T_SCR, 0)) +
+         " | Conf: "    + str.tostring(CN_PASS) + "/" + str.tostring(CN_CHECKS) +
+         " | Entry: "   + f_fmt(EP) +
+         " | SL: "      + f_fmt(SL) +
+         " | TP1: "     + f_fmt(TP1) +
+         " | TP2: "     + f_fmt(TP2) +
+         " | TP3: "     + f_fmt(TP3) +
+         " | "          + syminfo.ticker
+
+    alertcondition(T_GRD == "A+",            title="A+ Setup",            message=_msg)
+    alertcondition(T_GRD == "INSTITUTIONAL", title="Institutional Setup",  message=_msg)
+    alertcondition(T_GRD == "AGGRESSIVE",    title="Aggressive Setup",     message=_msg)
+
+alertcondition(PA_STATE == "chaotic", title="Chaotic Environment",
+     message="Chaotic environment detected | " + syminfo.ticker)
