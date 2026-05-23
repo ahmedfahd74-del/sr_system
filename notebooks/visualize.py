@@ -80,8 +80,14 @@ def plot_sr_chart(ticker: str = "AMD", primary_tf: str = "1D"):
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'/Users/ahmedaziz2/sr_system/notebooks/{ticker}_sr_analysis.png', dpi=150)
-    print(f"Chart saved to notebooks/{ticker}_sr_analysis.png")
+    # Save to the notebooks directory next to this file (works on any machine,
+    # not just the original developer's Mac).
+    out_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        f"{ticker}_sr_analysis.png",
+    )
+    plt.savefig(out_path, dpi=150)
+    print(f"Chart saved to {out_path}")
 
     # Print summary
     print("\n" + "="*60)

@@ -287,17 +287,17 @@ class ConfigManager:
         """
         Reload configuration from file.
 
+        An explicit call always re-reads the file. The mtime guard is only
+        needed inside the background auto-watch loop, where we want to skip
+        no-op reads. Filesystems track mtime at 1-second resolution, so two
+        writes within the same second would otherwise silently no-op here.
+
         Returns:
             True if reload was successful.
         """
         if not self._config_path:
             return False
-
-        current_mtime = os.path.getmtime(self._config_path)
-        if current_mtime > self._last_modified:
-            return self._load_from_file(self._config_path)
-
-        return False
+        return self._load_from_file(self._config_path)
 
     def start_watching(self):
         """Start background thread to watch for file changes."""
