@@ -281,13 +281,21 @@ var int    CN_PASS    = 0
 var int    CN_CHECKS  = 0
 
 f_phase_c() =>
-    _fvg=false   _fd="none"
-    _ifvg=false  _id="none"
-    _ob=false    _od="none"
-    _cdl=false   _ct="none"
-    _str=false   _sd="none"
-    _vol=false   _eff=false   _sess=false
-    _pass=0      _checks=0
+    _fvg   = false
+    _fd    = "none"
+    _ifvg  = false
+    _id    = "none"
+    _ob    = false
+    _od    = "none"
+    _cdl   = false
+    _ct    = "none"
+    _str   = false
+    _sd    = "none"
+    _vol   = false
+    _eff   = false
+    _sess  = false
+    _pass  = 0
+    _checks = 0
 
     // 1. FVG
     _checks += 1
