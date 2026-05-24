@@ -1,0 +1,789 @@
+//@version=6
+// ============================================================================
+// SR UNIFIED - Heatmap Zones + Institutional Confirmation Pipeline
+// ============================================================================
+// HOW IT WORKS:
+//   The heatmap (sr_auto_levels) finds WHERE the levels are.
+//   The pipeline (sr_pro_v5) decides WHEN to act on them.
+//   Combined rule: signals only fire when price is AT a heatmap zone.
+//
+// PIPELINE:
+//   Phase A  — Market regime (trending/ranging/chaotic/accumulation/distribution)
+//   Phase B  — Liquidity sweep at a HEATMAP zone (not just any pivot)
+//   Phase C  — 8 confirmations (FVG, iFVG, OB, Candle, BOS, Volume, Efficiency, Session)
+//   Score    — 0-100  |  A+ ≥90  |  Institutional ≥80  |  Aggressive ≥70
+// ============================================================================
+
+indicator("SR Unified - Zones + Pipeline",
+     shorttitle="SR UNIFIED", overlay=true,
+     max_lines_count=50, max_labels_count=50, max_boxes_count=30)
+
+// ============================================================================
+// INPUTS — HEATMAP (Zone Detection)
+// ============================================================================
+string G_HM = "1. Heatmap — Zone Detection"
+int   i_lookback  = input.int(300,  "Lookback bars (current TF)",  minval=50, maxval=5000,           group=G_HM)
+float i_zoneMult  = input.float(1.0,"Zone width (x ATR14)",         minval=0.2,maxval=5.0, step=0.1, group=G_HM)
+int   i_minVisits = input.int(3,    "Min bar-visits to form level", minval=1,  maxval=50,             group=G_HM)
+int   i_topN      = input.int(8,    "Max levels to draw (top N)",   minval=1,  maxval=20,             group=G_HM)
+
+string G_MTF = "2. Heatmap — Multi-Timeframe"
+bool   i_mtf_curr = input.bool(true,  "Current timeframe",   group=G_MTF)
+bool   i_mtf1_on  = input.bool(true,  "HTF 1",               group=G_MTF)
+string i_mtf1     = input.timeframe("D", "HTF 1 timeframe",  group=G_MTF)
+bool   i_mtf2_on  = input.bool(true,  "HTF 2",               group=G_MTF)
+string i_mtf2     = input.timeframe("W", "HTF 2 timeframe",  group=G_MTF)
+bool   i_mtf3_on  = input.bool(false, "HTF 3 (optional)",    group=G_MTF)
+string i_mtf3     = input.timeframe("M", "HTF 3 timeframe",  group=G_MTF)
+int    i_htfBars  = input.int(200, "HTF lookback bars",       minval=20, maxval=2000, group=G_MTF)
+
+
+// ============================================================================
+// INPUTS — PIPELINE (Confirmation)
+// ============================================================================
+string G_CTX = "3. Pipeline — Market Context"
+string i_mkt_override = input.string("Auto","Market Type",
+     options=["Auto","Forex","Crypto","Index","Commodity","Equity"], group=G_CTX)
+int    i_st_piv_len   = input.int(5, "Structure Pivot Length", minval=3, maxval=20, group=G_CTX)
+int    i_lq_mem       = input.int(10,"Sweep Memory (bars)",    minval=3, maxval=50, group=G_CTX)
+
+string G_SGN = "4. Pipeline — Confirmation"
+float  i_sg_min_score = input.float(70.0,"Min Trade Score",      minval=50,maxval=95,step=5,  group=G_SGN)
+int    i_cn_min_check = input.int(5,     "Min Confirmations",    minval=3, maxval=9,           group=G_SGN)
+bool   i_cn_fvg       = input.bool(true, "Confirm: FVG",         group=G_SGN)
+bool   i_cn_ifvg      = input.bool(true, "Confirm: iFVG",        group=G_SGN)
+bool   i_cn_ob        = input.bool(true, "Confirm: Order Block", group=G_SGN)
+bool   i_cn_candle    = input.bool(true, "Confirm: Candle",      group=G_SGN)
+bool   i_cn_struct    = input.bool(true, "Confirm: BOS/CHOCH",   group=G_SGN)
+bool   i_cn_volume    = input.bool(true, "Confirm: Volume",      group=G_SGN)
+bool   i_cn_eff       = input.bool(true, "Confirm: Efficiency",  group=G_SGN)
+bool   i_cn_session   = input.bool(true, "Confirm: Session",     group=G_SGN)
+
+string G_EXE = "5. Pipeline — Execution"
+float  i_ex_sl_atr = input.float(1.5,"Stop Loss (x ATR)",minval=0.5,maxval=5.0, step=0.25,group=G_EXE)
+float  i_ex_tp1    = input.float(1.5,"TP1 R:R",          minval=0.5,maxval=5.0, step=0.25,group=G_EXE)
+float  i_ex_tp2    = input.float(2.5,"TP2 R:R",          minval=1.0,maxval=10.0,step=0.5, group=G_EXE)
+float  i_ex_tp3    = input.float(4.0,"TP3 R:R",          minval=1.0,maxval=15.0,step=0.5, group=G_EXE)
+
+// KEY NEW INPUT — how close to a zone counts as "AT the zone"
+float  i_zone_prox = input.float(0.5,"Zone proximity filter (x ATR)",minval=0.1,maxval=3.0,step=0.1,
+     group=G_EXE,
+     tooltip="A signal only fires when price is within this many ATRs of a heatmap zone. 0.5 = must be within half an ATR of a known level.")
+
+string G_VIS = "6. Display"
+bool   i_vis_zones = input.bool(true, "Show heatmap zones",     group=G_VIS)
+bool   i_vis_dash  = input.bool(true, "Show dashboard",         group=G_VIS)
+bool   i_showLbls  = input.bool(true, "Show zone labels",       group=G_VIS)
+color  i_cSupp     = input.color(color.new(#00C853,0),"Support color",    group=G_VIS)
+color  i_cRes      = input.color(color.new(#FF1744,0),"Resistance color", group=G_VIS)
+color  i_cMTF      = input.color(color.new(#FFD600,0),"MTF confluence",   group=G_VIS)
+color  i_vis_bg    = input.color(color.new(#08081A,90),"Dashboard BG",    group=G_VIS)
+
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+f_get_atr(simple string tf, simple int len) =>
+    request.security(syminfo.tickerid, tf, ta.atr(len), lookahead=barmerge.lookahead_off)
+
+f_fmt(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+f_efficiency_ratio(int p) =>
+    _m = math.abs(close - close[p])
+    _n = 0.0
+    for _i = 0 to p - 1
+        _n += math.abs(close[_i] - close[_i + 1])
+    _n > 0 ? _m / _n : 0.0
+
+f_mkt_type() =>
+    _o = str.lower(i_mkt_override)
+    _o != "auto" ? _o :
+     syminfo.type == "forex"   ? "forex"     :
+     syminfo.type == "crypto"  ? "crypto"    :
+     (syminfo.type == "futures" or syminfo.type == "index") ? "index" :
+     syminfo.type == "cfd"     ? "commodity" : "equity"
+
+f_session() =>
+    _t = hour(time("60"), syminfo.timezone) * 60 + minute(time("60"), syminfo.timezone)
+    _t >= 60  and _t < 480  ? "Asian"  :
+     _t >= 480 and _t < 840  ? "London" :
+     _t >= 840 and _t < 1200 ? "NY"     :
+     _t >= 1200               ? "NY PM"  : "Closed"
+
+// ============================================================================
+// HEATMAP ENGINE
+// ============================================================================
+f_heatmap(float refATR, float zoneMult, int barsBack, int minVisits,
+     float[] highArr, float[] lowArr) =>
+    float zoneW = na(refATR) or refATR <= 0.0 ? close * 0.005 : refATR * zoneMult
+    float rHigh = highArr.get(0)
+    float rLow  = lowArr.get(0)
+    int   n     = highArr.size()
+    for i = 1 to n - 1
+        float h = highArr.get(i)
+        float l = lowArr.get(i)
+        if not na(h) and h > rHigh
+            rHigh := h
+        if not na(l) and l < rLow
+            rLow  := l
+    float totalRng = rHigh - rLow
+    if totalRng <= 0.0
+        totalRng := zoneW * 2.0
+        rLow     := close - zoneW
+        rHigh    := close + zoneW
+    int   nb  = math.max(1, math.min(500, int(math.ceil(totalRng / zoneW))))
+    float bw  = totalRng / float(nb)
+    array<int> hits = array.new<int>(nb, 0)
+    for i = 0 to n - 1
+        float h = highArr.get(i)
+        float l = lowArr.get(i)
+        if na(h) or na(l)
+            continue
+        int bLo = math.max(0, math.min(nb-1, int(math.floor((l - rLow) / bw))))
+        int bHi = math.max(0, math.min(nb-1, int(math.floor((h - rLow) / bw))))
+        for b = bLo to bHi
+            hits.set(b, hits.get(b) + 1)
+    array<float> prices  = array.new<float>()
+    array<int>   touches = array.new<int>()
+    bool  inZ   = false
+    float zSum  = 0.0
+    int   zCnt  = 0
+    int   zBest = 0
+    for b = 0 to nb - 1
+        int h = hits.get(b)
+        if h >= minVisits
+            float mid = rLow + (float(b) + 0.5) * bw
+            if not inZ
+                inZ   := true
+                zSum  := mid
+                zCnt  := 1
+                zBest := h
+            else
+                zSum  += mid
+                zCnt  += 1
+                zBest := math.max(zBest, h)
+        else
+            if inZ
+                prices.push(zSum / float(zCnt))
+                touches.push(zBest)
+                inZ := false
+    if inZ
+        prices.push(zSum / float(zCnt))
+        touches.push(zBest)
+    [prices, touches]
+
+
+// ============================================================================
+// HTF DATA
+// ============================================================================
+[htf1_h, htf1_l] = request.security(syminfo.tickerid, i_mtf1, [high, low], lookahead=barmerge.lookahead_off)
+[htf2_h, htf2_l] = request.security(syminfo.tickerid, i_mtf2, [high, low], lookahead=barmerge.lookahead_off)
+[htf3_h, htf3_l] = request.security(syminfo.tickerid, i_mtf3, [high, low], lookahead=barmerge.lookahead_off)
+htf1_atr = request.security(syminfo.tickerid, i_mtf1, ta.atr(14), lookahead=barmerge.lookahead_off)
+htf2_atr = request.security(syminfo.tickerid, i_mtf2, ta.atr(14), lookahead=barmerge.lookahead_off)
+htf3_atr = request.security(syminfo.tickerid, i_mtf3, ta.atr(14), lookahead=barmerge.lookahead_off)
+
+// ============================================================================
+// GLOBAL HEATMAP STATE  (shared between drawing and pipeline)
+// ============================================================================
+var array<float> g_zonePrices  = array.new<float>()
+var array<int>   g_zoneTouches = array.new<int>()
+var array<int>   g_zoneTFcount = array.new<int>()
+
+// ============================================================================
+// ZONE PROXIMITY CHECK
+// Returns true if current close is within (proximity * ATR) of any heatmap zone
+// Also returns the nearest zone price
+// ============================================================================
+f_near_zone(float[] zPrices, float atr, float proximity) =>
+    float nearest  = float(na)
+    bool  atZone   = false
+    int   sz       = zPrices.size()
+    float threshold = atr * proximity
+    if sz > 0
+        for i = 0 to sz - 1
+            float zp   = zPrices.get(i)
+            float dist = math.abs(close - zp)
+            if dist <= threshold
+                atZone := true
+                if na(nearest) or dist < math.abs(close - nearest)
+                    nearest := zp
+    [atZone, nearest]
+
+// ============================================================================
+// ATR + SESSION  (calculated once, used everywhere)
+// ============================================================================
+float ATR_14 = ta.atr(14)
+float ATR_D  = nz(f_get_atr("D",   14), ATR_14)
+float ATR_4H = nz(f_get_atr("240", 14), ATR_14)
+
+var string MKT_TYPE = ""
+var string CUR_SESS = "24/5"
+if barstate.isfirst
+    MKT_TYPE := f_mkt_type()
+CUR_SESS := f_session()
+
+
+// ============================================================================
+// PHASE A — MARKET REGIME
+// ============================================================================
+var string PA_STATE     = "unknown"
+var string PA_BIAS      = "neutral"
+var int    PA_CONFIRMED = 0
+var int    PA_TOTAL     = 0
+
+f_phase_a() =>
+    _atr     = ATR_14
+    _atr_sma = nz(ta.sma(_atr, 20), _atr)
+    _vol     = nz(volume, 0.0)
+    _vol_sma = nz(ta.sma(_vol, 20), 1.0)
+    _er      = f_efficiency_ratio(14)
+    _vr      = _atr_sma > 0 ? _atr / _atr_sma : 1.0
+    _s50     = close / nz(ta.sma(close, 50), close) - 1.0
+    _s20     = close / nz(ta.sma(close, 20), close) - 1.0
+    _st = "ranging"   _bi = "neutral"   _c = 0   _ch = 0
+    _ch += 1
+    if _vr > 1.8
+        _st := "chaotic"
+    else if _vr > 1.3 and _er > 0.35
+        _st := "trending"
+    else if _vr < 0.7
+        _st := "contracting"
+    _ch += 1
+    if _er > 0.35 and _st != "chaotic"
+        _c += 1
+    _ch += 1
+    if _s50 > 0.03
+        _bi := "bull"   _c += 1
+    else if _s50 < -0.03
+        _bi := "bear"   _c += 1
+    _ch += 1
+    if (_s20 > 0 and _s50 > 0) or (_s20 < 0 and _s50 < 0)
+        _c += 1
+    _ch += 1
+    if _st == "ranging" and _vol > _vol_sma * 1.3 and _bi == "bull" and _s20 > -0.01
+        _st := "accumulation"   _c += 1
+    _ch += 1
+    if _st == "ranging" and _vol > _vol_sma * 1.3 and _bi == "bear" and _s20 < 0.01
+        _st := "distribution"   _c += 1
+    _ch += 1
+    _wu = high - math.max(open, close)
+    _wd = math.min(open, close) - low
+    _bod = math.abs(close - open)
+    if _bod > 0 and (_wu > _bod * 0.7 or _wd > _bod * 0.7) and _vol > _vol_sma * 1.2
+        _st := "manipulation"   _c += 1
+    _ch += 1
+    if (high - low) / math.max(low, syminfo.mintick) * 100.0 < 0.05
+        _st := "low_liquidity"   _c := 0
+    [_st, _bi, _c, _ch]
+
+[PA_STATE, PA_BIAS, PA_CONFIRMED, PA_TOTAL] = f_phase_a()
+
+
+// ============================================================================
+// PHASE B — LIQUIDITY SWEEP  (only at a heatmap zone)
+// ============================================================================
+var bool   PB_SWEPT = false
+var string PB_DIR   = "none"
+var float  PB_DEPTH = 0.0
+var string PB_TYPE  = "none"
+var int    PB_CONF  = 0
+var int    PB_TOTAL = 0
+
+// NEW: track which zone was swept
+var float  PB_ZONE_PRICE = float(na)
+
+f_phase_b(bool atZone, float nearestZone) =>
+    _sw  = false   _dir = "none"   _dep = 0.0   _typ = "none"   _c = 0   _ch = 0
+    _zp  = nearestZone
+
+    _sw_h = ta.pivothigh(high, i_st_piv_len, i_st_piv_len)
+    _sw_l = ta.pivotlow(low,   i_st_piv_len, i_st_piv_len)
+
+    _ch += 1
+    // KEY CHANGE: sweep only counts if it also coincides with a heatmap zone
+    if not na(_sw_h) and high > _sw_h and atZone
+        _sw  := true   _dir := "short"   _dep := high - _sw_h   _typ := "zone_high_sweep"   _c += 1
+
+    _ch += 1
+    if not na(_sw_l) and low < _sw_l and atZone
+        _sw := true   _dir := "long"   _dep := _sw_l - low
+        _typ := _typ == "zone_high_sweep" ? "both" : "zone_low_sweep"   _c += 1
+
+    _eqh_cnt = 0   _eqh_p = 0.0   _eql_cnt = 0   _eql_p = 0.0
+    _ch += 1
+    for _i = 0 to i_lq_mem
+        for _j = _i + 1 to i_lq_mem
+            if not na(high[_i]) and not na(high[_j])
+                if math.abs(high[_i] - high[_j]) / math.max(high[_i], syminfo.mintick) < 0.0005
+                    _eqh_cnt += 1   _eqh_p := high[_i]
+    if _eqh_cnt >= 2 and high > _eqh_p and atZone
+        _sw := true   _dir := "short"
+        _typ := _typ == "both" ? "both" : "equal_highs"   _c += 1
+
+    _ch += 1
+    for _i = 0 to i_lq_mem
+        for _j = _i + 1 to i_lq_mem
+            if not na(low[_i]) and not na(low[_j])
+                if math.abs(low[_i] - low[_j]) / math.max(low[_i], syminfo.mintick) < 0.0005
+                    _eql_cnt += 1   _eql_p := low[_i]
+    if _eql_cnt >= 2 and low < _eql_p and atZone
+        _sw := true   _dir := "long"
+        _typ := _typ == "both" ? "both" : "equal_lows"   _c += 1
+
+    _ch += 1
+    if _sw
+        _reclaim = (_dir == "long" and close > _eql_p) or (_dir == "short" and close < _eqh_p)
+        if _reclaim
+            _c += 1   _typ := _typ + "_reclaim"
+
+    [_sw, _dir, _dep, _typ, _c, _ch, _zp]
+
+// We need the proximity check result first — build it from the global zone arrays
+float _prox_atr   = nz(ATR_14, close * 0.001)
+bool  _at_zone    = false
+float _nearest_zp = float(na)
+if g_zonePrices.size() > 0
+    [_az, _nz] = f_near_zone(g_zonePrices, _prox_atr, i_zone_prox)
+    _at_zone    := _az
+    _nearest_zp := _nz
+
+[PB_SWEPT, PB_DIR, PB_DEPTH, PB_TYPE, PB_CONF, PB_TOTAL, PB_ZONE_PRICE] =
+     f_phase_b(_at_zone, _nearest_zp)
+
+
+// ============================================================================
+// PHASE C — 8 CONFIRMATIONS
+// ============================================================================
+var bool   CN_FVG    = false   var string CN_FVG_D  = "none"
+var bool   CN_IFVG   = false   var string CN_IFVG_D = "none"
+var bool   CN_OB     = false   var string CN_OB_D   = "none"
+var bool   CN_CANDLE = false   var string CN_CDL_T  = "none"
+var bool   CN_STRUCT = false   var string CN_STR_D  = "none"
+var bool   CN_VOL    = false
+var bool   CN_EFF    = false
+var bool   CN_SESS   = false
+var string CN_DIR    = "none"
+var int    CN_PASS   = 0
+var int    CN_CHECKS = 0
+
+f_phase_c() =>
+    _fvg=false  _fd="none"  _ifvg=false  _id="none"  _ob=false  _od="none"
+    _cdl=false  _ct="none"  _str=false   _sd="none"
+    _vol=false  _eff=false  _sess=false
+    _pass=0     _checks=0
+
+    _checks += 1
+    if i_cn_fvg
+        if not na(low[1]) and not na(high[2]) and low[1] > high[2]
+            _fvg:=true  _fd:="bull"  _pass+=1
+        if not na(high[1]) and not na(low[2]) and high[1] < low[2]
+            _fvg:=true  _fd:="bear"  _pass+=1
+
+    _checks += 1
+    if i_cn_ifvg
+        if not na(low[2]) and not na(high[3]) and low[2] > high[3]
+            if close >= high[3] and close <= low[2]
+                _ifvg:=true  _id:="bull"  _pass+=1
+        if not na(high[2]) and not na(low[3]) and high[2] < low[3]
+            if close >= high[2] and close <= low[3]
+                _ifvg:=true  _id:="bear"  _pass+=1
+
+    _checks += 1
+    if i_cn_ob
+        if close>close[1] and close[1]>close[2] and close[2]>close[3] and close[3]<open[3]
+            _ob:=true  _od:="bull"  _pass+=1
+        if close<close[1] and close[1]<close[2] and close[2]<close[3] and close[3]>open[3]
+            _ob:=true  _od:="bear"  _pass+=1
+
+    _checks += 1
+    if i_cn_candle
+        _body=math.abs(close-open)  _range=math.max(high-low,syminfo.mintick)
+        _upper=high-math.max(open,close)  _lower=math.min(open,close)-low
+        if close[1]<open[1] and close>open and close>open[1] and open<close[1]
+            _cdl:=true  _ct:="bull_engulf"  _pass+=1
+        else if close[1]>open[1] and close<open and close<open[1] and open>close[1]
+            _cdl:=true  _ct:="bear_engulf"  _pass+=1
+        else if _body<_range*0.3 and _lower>_body*2 and close>(high+low)/2
+            _cdl:=true  _ct:="bull_pin"  _pass+=1
+        else if _body<_range*0.3 and _upper>_body*2 and close<(high+low)/2
+            _cdl:=true  _ct:="bear_pin"  _pass+=1
+
+    _checks += 1
+    if i_cn_struct
+        _ph=ta.pivothigh(high,i_st_piv_len,i_st_piv_len)
+        _pl=ta.pivotlow(low,i_st_piv_len,i_st_piv_len)
+        if not na(_ph) and high > ta.valuewhen(not na(_ph),_ph,1)
+            _str:=true  _sd:="bull"  _pass+=1
+        if not na(_pl) and low < ta.valuewhen(not na(_pl),_pl,1)
+            _str:=true  _sd:="bear"  _pass+=1
+
+    _checks += 1
+    if i_cn_volume
+        _vc=nz(volume,0.0)  _va=nz(ta.sma(_vc,20),1.0)
+        if _va>0 and _vc>_va*1.3
+            _vol:=true  _pass+=1
+
+    _checks += 1
+    if i_cn_eff
+        _er=f_efficiency_ratio(14)
+        if _er>0.3
+            _eff:=true  _pass+=1
+        else if _er>0.2
+            _pass+=1
+
+    _checks += 1
+    if i_cn_session
+        if CUR_SESS=="London" or CUR_SESS=="NY"
+            _sess:=true  _pass+=1
+        else if CUR_SESS=="Asian"
+            _pass+=1
+
+    _bulls=0  _bears=0
+    if _fd=="bull"  _bulls+=1
+    if _fd=="bear"  _bears+=1
+    if _id=="bull"  _bulls+=1
+    if _id=="bear"  _bears+=1
+    if _od=="bull"  _bulls+=1
+    if _od=="bear"  _bears+=1
+    if _sd=="bull"  _bulls+=1
+    if _sd=="bear"  _bears+=1
+    if _ct=="bull_engulf" or _ct=="bull_pin"  _bulls+=1
+    if _ct=="bear_engulf" or _ct=="bear_pin"  _bears+=1
+    if PB_DIR=="long"   _bulls+=1
+    if PB_DIR=="short"  _bears+=1
+    _dir = _bulls>_bears ? "long" : _bears>_bulls ? "short" : "none"
+    [_fvg,_fd,_ifvg,_id,_ob,_od,_cdl,_ct,_str,_sd,_vol,_eff,_sess,_dir,_pass,_checks]
+
+[CN_FVG,CN_FVG_D,CN_IFVG,CN_IFVG_D,CN_OB,CN_OB_D,
+ CN_CANDLE,CN_CDL_T,CN_STRUCT,CN_STR_D,
+ CN_VOL,CN_EFF,CN_SESS,CN_DIR,CN_PASS,CN_CHECKS] = f_phase_c()
+
+
+// ============================================================================
+// ENTRY / STOP / TARGETS
+// ============================================================================
+var float  EP    = float(na)
+var float  SL    = float(na)
+var float  TP1   = float(na)
+var float  TP2   = float(na)
+var float  TP3   = float(na)
+var string T_DIR = "none"
+var float  T_SCR = 0.0
+var string T_GRD = "none"
+var bool   T_VLD = false
+
+f_calc_entry() =>
+    _atr   = ATR_14
+    _dir   = CN_DIR
+    _entry = float(na)   _sl=float(na)   _tp1=float(na)   _tp2=float(na)   _tp3=float(na)
+    _score = 0.0   _grade="none"   _valid=false
+
+    // NEW GATE: signal only fires if price is actually AT a heatmap zone
+    _ok = CN_PASS >= i_cn_min_check
+         and PA_STATE != "chaotic" and PA_STATE != "low_liquidity"
+         and _at_zone                          // <<< THE KEY FILTER
+
+    if _ok and _dir != "none"
+        _base  = float(CN_PASS) / float(math.max(CN_CHECKS,1)) * 50.0
+        _bA    = PA_CONFIRMED > PA_TOTAL / 2 ? 15.0 : 5.0
+        _bB    = PB_SWEPT ? 20.0 : 0.0
+        _bZ    = not na(PB_ZONE_PRICE) ? 5.0 : 0.0   // bonus for confirmed zone hit
+        _bD    = PB_DEPTH > 0 and _atr > 0 ? math.min(10.0, PB_DEPTH / _atr * 10.0) : 0.0
+        _score := math.min(100.0, _base + _bA + _bB + _bZ + _bD)
+
+        if _score >= 90.0       _grade := "A+"
+        else if _score >= 80.0  _grade := "INSTITUTIONAL"
+        else if _score >= 70.0  _grade := "AGGRESSIVE"
+        else                    _grade := "WATCHLIST"
+
+        if _score >= i_sg_min_score
+            _entry := close
+            if _dir == "long"
+                _sl := low  - _atr * i_ex_sl_atr * 0.5
+                if PB_SWEPT and PB_DIR == "long"
+                    _sl := math.min(_sl, low - _atr * 0.3)
+                // Place SL just below the heatmap zone if available
+                if not na(PB_ZONE_PRICE) and PB_ZONE_PRICE < _entry
+                    _sl := math.min(_sl, PB_ZONE_PRICE - _atr * 0.3)
+            else
+                _sl := high + _atr * i_ex_sl_atr * 0.5
+                if PB_SWEPT and PB_DIR == "short"
+                    _sl := math.max(_sl, high + _atr * 0.3)
+                if not na(PB_ZONE_PRICE) and PB_ZONE_PRICE > _entry
+                    _sl := math.max(_sl, PB_ZONE_PRICE + _atr * 0.3)
+
+            _risk = math.abs(_entry - _sl)
+            if _risk > 0
+                _tp1 := _dir=="long" ? _entry+_risk*i_ex_tp1 : _entry-_risk*i_ex_tp1
+                _tp2 := _dir=="long" ? _entry+_risk*i_ex_tp2 : _entry-_risk*i_ex_tp2
+                _tp3 := _dir=="long" ? _entry+_risk*i_ex_tp3 : _entry-_risk*i_ex_tp3
+            _valid := true
+
+    [_entry,_sl,_tp1,_tp2,_tp3,_dir,_score,_grade,_valid]
+
+[EP,SL,TP1,TP2,TP3,T_DIR,T_SCR,T_GRD,T_VLD] = f_calc_entry()
+
+
+// ============================================================================
+// HEATMAP DRAWING + ZONE ARRAY POPULATION  (barstate.islast)
+// ============================================================================
+var array<line>  drawnLines  = array.new<line>()
+var array<label> drawnLabels = array.new<label>()
+
+f_do_merge(float[] src_p, int[] src_t, float mergeThresh) =>
+    int np = src_p.size()
+    if np > 0
+        for i = 0 to np - 1
+            float p = src_p.get(i)
+            int   t = src_t.get(i)
+            bool  found = false
+            int   sz = g_zonePrices.size()
+            if sz > 0
+                for j = 0 to sz - 1
+                    if math.abs(p - g_zonePrices.get(j)) <= mergeThresh
+                        g_zoneTouches.set(j, g_zoneTouches.get(j) + t)
+                        g_zoneTFcount.set(j, g_zoneTFcount.get(j) + 1)
+                        found := true
+                        break
+            if not found
+                g_zonePrices.push(p)
+                g_zoneTouches.push(t)
+                g_zoneTFcount.push(1)
+
+if barstate.islast
+    // Clear old drawings
+    for ln in drawnLines
+        line.delete(ln)
+    drawnLines.clear()
+    for lb in drawnLabels
+        label.delete(lb)
+    drawnLabels.clear()
+
+    // Rebuild zone arrays
+    g_zonePrices.clear()
+    g_zoneTouches.clear()
+    g_zoneTFcount.clear()
+
+    float atr14  = ta.atr(14)
+    float mThresh = na(atr14) or atr14 <= 0.0 ? close * 0.005 : atr14 * i_zoneMult
+
+    int bk = math.min(i_lookback, bar_index)
+    array<float> curr_h = array.new<float>(bk)
+    array<float> curr_l = array.new<float>(bk)
+    for i = 0 to bk - 1
+        curr_h.set(i, high[i])
+        curr_l.set(i, low[i])
+
+    int htfBk = math.min(i_htfBars, bar_index)
+    array<float> h1_h = array.new<float>(htfBk)   array<float> h1_l = array.new<float>(htfBk)
+    array<float> h2_h = array.new<float>(htfBk)   array<float> h2_l = array.new<float>(htfBk)
+    array<float> h3_h = array.new<float>(htfBk)   array<float> h3_l = array.new<float>(htfBk)
+    for i = 0 to htfBk - 1
+        h1_h.set(i,htf1_h[i])   h1_l.set(i,htf1_l[i])
+        h2_h.set(i,htf2_h[i])   h2_l.set(i,htf2_l[i])
+        h3_h.set(i,htf3_h[i])   h3_l.set(i,htf3_l[i])
+
+    if i_mtf_curr
+        [cp,ct] = f_heatmap(atr14,i_zoneMult,bk,i_minVisits,curr_h,curr_l)
+        f_do_merge(cp,ct,mThresh)
+    if i_mtf1_on and not na(htf1_atr)
+        [p1,t1] = f_heatmap(htf1_atr,i_zoneMult,htfBk,i_minVisits,h1_h,h1_l)
+        f_do_merge(p1,t1,mThresh)
+    if i_mtf2_on and not na(htf2_atr)
+        [p2,t2] = f_heatmap(htf2_atr,i_zoneMult,htfBk,i_minVisits,h2_h,h2_l)
+        f_do_merge(p2,t2,mThresh)
+    if i_mtf3_on and not na(htf3_atr)
+        [p3,t3] = f_heatmap(htf3_atr,i_zoneMult,htfBk,i_minVisits,h3_h,h3_l)
+        f_do_merge(p3,t3,mThresh)
+
+    int numZones = g_zonePrices.size()
+
+    // Sort by touch count descending
+    if numZones > 1
+        for i = 0 to numZones - 2
+            int mx = i
+            for j = i + 1 to numZones - 1
+                if g_zoneTouches.get(j) > g_zoneTouches.get(mx)
+                    mx := j
+            if mx != i
+                float tp=g_zonePrices.get(i)   int tt=g_zoneTouches.get(i)   int tfc=g_zoneTFcount.get(i)
+                g_zonePrices.set(i,g_zonePrices.get(mx))     g_zoneTouches.set(i,g_zoneTouches.get(mx))   g_zoneTFcount.set(i,g_zoneTFcount.get(mx))
+                g_zonePrices.set(mx,tp)   g_zoneTouches.set(mx,tt)   g_zoneTFcount.set(mx,tfc)
+
+    // Draw zones
+    if i_vis_zones
+        int  topN    = math.min(i_topN, numZones)
+        int  maxT    = topN > 0 ? g_zoneTouches.get(0) : i_minVisits
+        int  sC=0   int rC=0   int mC=0
+
+        if topN > 0
+            for i = 0 to topN - 1
+                float lp  = g_zonePrices.get(i)
+                int   lt  = g_zoneTouches.get(i)
+                int   tfc = g_zoneTFcount.get(i)
+                bool  isSupp = lp <= close
+                bool  isMTF  = tfc >= 2
+                color col = isMTF ? i_cMTF : isSupp ? i_cSupp : i_cRes
+                float ratio = maxT > 0 ? float(lt)/float(maxT) : 0.0
+                int   lw  = 1 + int(math.round(ratio * 2.0))
+                if isMTF   lw := math.min(4, lw+1)
+                line ln = line.new(bar_index-math.min(i_lookback,bar_index), lp,
+                     bar_index+8, lp, xloc=xloc.bar_index, extend=extend.both,
+                     color=col, width=lw, style=line.style_dashed)
+                drawnLines.push(ln)
+                if i_showLbls
+                    string tfTag = isMTF ? " MTF"+str.tostring(tfc) : ""
+                    label lb = label.new(bar_index+8, lp,
+                         str.tostring(lp,format.mintick)+" ["+str.tostring(lt)+"x]"+tfTag,
+                         xloc=xloc.bar_index, color=color.new(col,80),
+                         textcolor=col, style=label.style_label_left, size=size.small)
+                    drawnLabels.push(lb)
+                if isSupp  sC+=1  else  rC+=1
+                if isMTF   mC+=1
+
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+var table _d = na
+if i_vis_dash and na(_d)
+    _d := table.new(position.top_right, 2, 22,
+         bgcolor=i_vis_bg, border_color=color.new(#2A2A5A,50),
+         border_width=1, frame_width=1)
+
+if barstate.islast and i_vis_dash and not na(_d)
+    color _tc  = color.new(#CCCCDD,0)
+    color _bg  = color.new(#08081A,90)
+    color _bh  = color.new(#12123A,85)
+    color _gr  = color.new(#26A69A,0)
+    color _rd  = color.new(#EF5350,0)
+    color _yl  = color.new(#FFD600,0)
+    color _or  = color.new(#FF9800,0)
+    color _dim = color.new(#555577,0)
+    int _r = 0
+
+    table.cell(_d,0,_r,"SR UNIFIED",       text_color=color.new(#E0E0FF,0),text_size=size.small,bgcolor=_bh)
+    table.cell(_d,1,_r,MKT_TYPE,           text_color=color.new(#666688,0),text_size=size.small,bgcolor=_bh)
+    _r+=1
+    color _pc = PA_STATE=="trending" or PA_STATE=="accumulation" ? _gr :
+         PA_STATE=="distribution" or PA_STATE=="chaotic" ? _rd :
+         PA_STATE=="manipulation" ? _or : PA_STATE=="low_liquidity" ? _dim : _yl
+    table.cell(_d,0,_r,"Regime",     text_color=_tc,  text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,PA_STATE,     text_color=_pc,  text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+    table.cell(_d,0,_r,"Bias",       text_color=_tc,  text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,PA_BIAS,      text_color=PA_BIAS=="bull"?_gr:PA_BIAS=="bear"?_rd:_dim,text_size=size.tiny,bgcolor=_bh)
+    _r+=1
+    table.cell(_d,0,_r,"Session",    text_color=_tc,  text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,CUR_SESS,     text_color=color.new(#80CBC4,0),text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+
+    // NEW: Zone proximity display
+    color _zc = _at_zone ? _gr : _dim
+    table.cell(_d,0,_r,"At Zone",    text_color=_tc,  text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,_at_zone ? "YES " + f_fmt(PB_ZONE_PRICE) : "NO — waiting",
+         text_color=_zc, text_size=size.tiny, bgcolor=_bh)
+    _r+=1
+    table.cell(_d,0,_r,"Zones",      text_color=_tc,  text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,str.tostring(g_zonePrices.size())+" total | "+str.tostring(i_topN)+" drawn",
+         text_color=color.new(#80CBC4,0),text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+
+    table.cell(_d,0,_r,"Liq Sweep",  text_color=_tc,  text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,PB_SWEPT ? "YES "+PB_DIR+" @ zone" : "NO",
+         text_color=PB_SWEPT?_or:_dim,text_size=size.tiny,bgcolor=_bh)
+    _r+=1
+    string _pct = CN_CHECKS>0 ? str.tostring(math.round(float(CN_PASS)/float(CN_CHECKS)*100.0,0))+"%" : "-"
+    table.cell(_d,0,_r,"CONFIRMS",   text_color=color.new(#E0E0FF,0),text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,str.tostring(CN_PASS)+"/"+str.tostring(CN_CHECKS)+" "+_pct,
+         text_color=CN_PASS>=i_cn_min_check?_gr:_rd,text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+    table.cell(_d,0,_r,CN_FVG?"FVG "+CN_FVG_D:"FVG --",     text_color=CN_FVG?_gr:_dim,text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,CN_IFVG?"iFVG "+CN_IFVG_D:"iFVG --", text_color=CN_IFVG?_gr:_dim,text_size=size.tiny,bgcolor=_bh)
+    _r+=1
+    table.cell(_d,0,_r,CN_OB?"OB "+CN_OB_D:"OB --",         text_color=CN_OB?_gr:_dim,text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,CN_CANDLE?CN_CDL_T:"Candle --",       text_color=CN_CANDLE?_gr:_dim,text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+    table.cell(_d,0,_r,CN_STRUCT?"BOS "+CN_STR_D:"BOS --",   text_color=CN_STRUCT?_gr:_dim,text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,CN_VOL?"VOL":"VOL --",                text_color=CN_VOL?_gr:_dim,text_size=size.tiny,bgcolor=_bh)
+    _r+=1
+    table.cell(_d,0,_r,CN_EFF?"EFF":"EFF --",                text_color=CN_EFF?_gr:_dim,text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,CN_SESS?"SESS":"SESS --",              text_color=CN_SESS?_gr:_dim,text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+    color _tc2 = T_GRD=="A+"?_gr:T_GRD=="INSTITUTIONAL"?_yl:T_GRD=="AGGRESSIVE"?_or:T_GRD=="WATCHLIST"?color.new(#4488FF,0):_dim
+    table.cell(_d,0,_r,"TRADE",      text_color=color.new(#E0E0FF,0),text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,T_VLD?T_DIR+" "+T_GRD:"NO TRADE — not at zone",text_color=_tc2,text_size=size.tiny,bgcolor=_bh)
+    _r+=1
+    color _sc = T_SCR>=90?_gr:T_SCR>=80?_yl:T_SCR>=70?_or:_dim
+    table.cell(_d,0,_r,"Score",      text_color=_tc,text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,str.tostring(math.round(T_SCR,0)),text_color=_sc,text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+    table.cell(_d,0,_r,"ENTRY",      text_color=_tc,                   text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,f_fmt(EP),    text_color=color.new(#80CBC4,0),  text_size=size.tiny,bgcolor=_bh)
+    _r+=1
+    table.cell(_d,0,_r,"SL",         text_color=_rd, text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,f_fmt(SL),    text_color=_rd, text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+    table.cell(_d,0,_r,"TP1",        text_color=_gr, text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,f_fmt(TP1),   text_color=_gr, text_size=size.tiny,bgcolor=_bh)
+    _r+=1
+    table.cell(_d,0,_r,"TP2",        text_color=_yl, text_size=size.tiny,bgcolor=_bg)
+    table.cell(_d,1,_r,f_fmt(TP2),   text_color=_yl, text_size=size.tiny,bgcolor=_bg)
+    _r+=1
+    table.cell(_d,0,_r,"TP3",        text_color=_or, text_size=size.tiny,bgcolor=_bh)
+    table.cell(_d,1,_r,f_fmt(TP3),   text_color=_or, text_size=size.tiny,bgcolor=_bh)
+
+
+// ============================================================================
+// ENTRY SIGNALS ON CHART
+// ============================================================================
+// Only plotted when price is AT a heatmap zone AND all conditions pass
+plotshape(T_VLD and T_DIR=="long"  and T_GRD!="WATCHLIST",
+     title="Long Signal", style=shape.triangleup,
+     location=location.belowbar, color=color.new(#26A69A,0),
+     size=size.normal, text="", textcolor=color.white)
+
+plotshape(T_VLD and T_DIR=="short" and T_GRD!="WATCHLIST",
+     title="Short Signal", style=shape.triangledown,
+     location=location.abovebar, color=color.new(#EF5350,0),
+     size=size.normal, text="", textcolor=color.white)
+
+// A+ signals get a bigger label
+plotshape(T_VLD and T_DIR=="long"  and T_GRD=="A+",
+     title="A+ Long",  style=shape.labelup,
+     location=location.belowbar, color=color.new(#26A69A,0),
+     size=size.large, text="A+", textcolor=color.white)
+
+plotshape(T_VLD and T_DIR=="short" and T_GRD=="A+",
+     title="A+ Short", style=shape.labeldown,
+     location=location.abovebar, color=color.new(#EF5350,0),
+     size=size.large, text="A+", textcolor=color.white)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+if T_VLD
+    string _msg = T_DIR+" "+T_GRD+
+         " | Score: "  +str.tostring(math.round(T_SCR,0))+
+         " | Zone: "   +f_fmt(PB_ZONE_PRICE)+
+         " | Conf: "   +str.tostring(CN_PASS)+"/"+str.tostring(CN_CHECKS)+
+         " | Entry: "  +f_fmt(EP)+
+         " | SL: "     +f_fmt(SL)+
+         " | TP1: "    +f_fmt(TP1)+
+         " | TP2: "    +f_fmt(TP2)+
+         " | TP3: "    +f_fmt(TP3)+
+         " | "         +syminfo.ticker
+
+    alertcondition(T_GRD=="A+",            title="A+ Setup at Zone",           message=_msg)
+    alertcondition(T_GRD=="INSTITUTIONAL", title="Institutional Setup at Zone", message=_msg)
+    alertcondition(T_GRD=="AGGRESSIVE",    title="Aggressive Setup at Zone",    message=_msg)
+
+alertcondition(_at_zone and not T_VLD,
+     title="Price at Zone — No Signal Yet",
+     message="Price approaching heatmap zone but confirmation pending | "+syminfo.ticker)
+
+alertcondition(PA_STATE=="chaotic",
+     title="Chaotic Environment",
+     message="Chaotic environment — avoid trading | "+syminfo.ticker)
