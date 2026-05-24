@@ -258,27 +258,33 @@ f_phase_a() =>
         _c += 1
     _ch += 1
     if _s50 > 0.03
-        _bi := "bull"   _c += 1
+        _bi := "bull"
+        _c  += 1
     else if _s50 < -0.03
-        _bi := "bear"   _c += 1
+        _bi := "bear"
+        _c  += 1
     _ch += 1
     if (_s20 > 0 and _s50 > 0) or (_s20 < 0 and _s50 < 0)
         _c += 1
     _ch += 1
     if _st == "ranging" and _vol > _vol_sma * 1.3 and _bi == "bull" and _s20 > -0.01
-        _st := "accumulation"   _c += 1
+        _st := "accumulation"
+        _c  += 1
     _ch += 1
     if _st == "ranging" and _vol > _vol_sma * 1.3 and _bi == "bear" and _s20 < 0.01
-        _st := "distribution"   _c += 1
+        _st := "distribution"
+        _c  += 1
     _ch += 1
     _wu = high - math.max(open, close)
     _wd = math.min(open, close) - low
     _bod = math.abs(close - open)
     if _bod > 0 and (_wu > _bod * 0.7 or _wd > _bod * 0.7) and _vol > _vol_sma * 1.2
-        _st := "manipulation"   _c += 1
+        _st := "manipulation"
+        _c  += 1
     _ch += 1
     if (high - low) / math.max(low, syminfo.mintick) * 100.0 < 0.05
-        _st := "low_liquidity"   _c := 0
+        _st := "low_liquidity"
+        _c  := 0
     [_st, _bi, _c, _ch]
 
 [PA_STATE, PA_BIAS, PA_CONFIRMED, PA_TOTAL] = f_phase_a()
@@ -312,12 +318,19 @@ f_phase_b(bool atZone, float nearestZone) =>
     _ch += 1
     // KEY CHANGE: sweep only counts if it also coincides with a heatmap zone
     if not na(_sw_h) and high > _sw_h and atZone
-        _sw  := true   _dir := "short"   _dep := high - _sw_h   _typ := "zone_high_sweep"   _c += 1
+        _sw  := true
+        _dir := "short"
+        _dep := high - _sw_h
+        _typ := "zone_high_sweep"
+        _c   += 1
 
     _ch += 1
     if not na(_sw_l) and low < _sw_l and atZone
-        _sw := true   _dir := "long"   _dep := _sw_l - low
-        _typ := _typ == "zone_high_sweep" ? "both" : "zone_low_sweep"   _c += 1
+        _sw  := true
+        _dir := "long"
+        _dep := _sw_l - low
+        _typ := _typ == "zone_high_sweep" ? "both" : "zone_low_sweep"
+        _c   += 1
 
     _eqh_cnt = 0
     _eqh_p   = 0.0
@@ -328,26 +341,33 @@ f_phase_b(bool atZone, float nearestZone) =>
         for _j = _i + 1 to i_lq_mem
             if not na(high[_i]) and not na(high[_j])
                 if math.abs(high[_i] - high[_j]) / math.max(high[_i], syminfo.mintick) < 0.0005
-                    _eqh_cnt += 1   _eqh_p := high[_i]
+                    _eqh_cnt += 1
+                    _eqh_p   := high[_i]
     if _eqh_cnt >= 2 and high > _eqh_p and atZone
-        _sw := true   _dir := "short"
-        _typ := _typ == "both" ? "both" : "equal_highs"   _c += 1
+        _sw  := true
+        _dir := "short"
+        _typ := _typ == "both" ? "both" : "equal_highs"
+        _c   += 1
 
     _ch += 1
     for _i = 0 to i_lq_mem
         for _j = _i + 1 to i_lq_mem
             if not na(low[_i]) and not na(low[_j])
                 if math.abs(low[_i] - low[_j]) / math.max(low[_i], syminfo.mintick) < 0.0005
-                    _eql_cnt += 1   _eql_p := low[_i]
+                    _eql_cnt += 1
+                    _eql_p   := low[_i]
     if _eql_cnt >= 2 and low < _eql_p and atZone
-        _sw := true   _dir := "long"
-        _typ := _typ == "both" ? "both" : "equal_lows"   _c += 1
+        _sw  := true
+        _dir := "long"
+        _typ := _typ == "both" ? "both" : "equal_lows"
+        _c   += 1
 
     _ch += 1
     if _sw
         _reclaim = (_dir == "long" and close > _eql_p) or (_dir == "short" and close < _eqh_p)
         if _reclaim
-            _c += 1   _typ := _typ + "_reclaim"
+            _c   += 1
+            _typ := _typ + "_reclaim"
 
     [_sw, _dir, _dep, _typ, _c, _ch, _zp]
 
@@ -367,11 +387,16 @@ if g_zonePrices.size() > 0
 // ============================================================================
 // PHASE C — 8 CONFIRMATIONS
 // ============================================================================
-var bool   CN_FVG    = false   var string CN_FVG_D  = "none"
-var bool   CN_IFVG   = false   var string CN_IFVG_D = "none"
-var bool   CN_OB     = false   var string CN_OB_D   = "none"
-var bool   CN_CANDLE = false   var string CN_CDL_T  = "none"
-var bool   CN_STRUCT = false   var string CN_STR_D  = "none"
+var bool   CN_FVG    = false
+var string CN_FVG_D  = "none"
+var bool   CN_IFVG   = false
+var string CN_IFVG_D = "none"
+var bool   CN_OB     = false
+var string CN_OB_D   = "none"
+var bool   CN_CANDLE = false
+var string CN_CDL_T  = "none"
+var bool   CN_STRUCT = false
+var string CN_STR_D  = "none"
 var bool   CN_VOL    = false
 var bool   CN_EFF    = false
 var bool   CN_SESS   = false
@@ -421,8 +446,10 @@ f_phase_c() =>
 
     _checks += 1
     if i_cn_candle
-        _body=math.abs(close-open)  _range=math.max(high-low,syminfo.mintick)
-        _upper=high-math.max(open,close)  _lower=math.min(open,close)-low
+        _body  = math.abs(close - open)
+        _range = math.max(high - low, syminfo.mintick)
+        _upper = high - math.max(open, close)
+        _lower = math.min(open, close) - low
         if close[1]<open[1] and close>open and close>open[1] and open<close[1]
             _cdl:=true  _ct:="bull_engulf"  _pass+=1
         else if close[1]>open[1] and close<open and close<open[1] and open>close[1]
@@ -434,8 +461,8 @@ f_phase_c() =>
 
     _checks += 1
     if i_cn_struct
-        _ph=ta.pivothigh(high,i_st_piv_len,i_st_piv_len)
-        _pl=ta.pivotlow(low,i_st_piv_len,i_st_piv_len)
+        _ph = ta.pivothigh(high, i_st_piv_len, i_st_piv_len)
+        _pl = ta.pivotlow(low,  i_st_piv_len, i_st_piv_len)
         if not na(_ph) and high > ta.valuewhen(not na(_ph),_ph,1)
             _str:=true  _sd:="bull"  _pass+=1
         if not na(_pl) and low < ta.valuewhen(not na(_pl),_pl,1)
@@ -443,7 +470,8 @@ f_phase_c() =>
 
     _checks += 1
     if i_cn_volume
-        _vc=nz(volume,0.0)  _va=nz(ta.sma(_vc,20),1.0)
+        _vc = nz(volume, 0.0)
+        _va = nz(ta.sma(_vc, 20), 1.0)
         if _va>0 and _vc>_va*1.3
             _vol:=true  _pass+=1
 
