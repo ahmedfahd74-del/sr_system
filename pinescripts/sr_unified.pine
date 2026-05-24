@@ -242,7 +242,10 @@ f_phase_a() =>
     _vr      = _atr_sma > 0 ? _atr / _atr_sma : 1.0
     _s50     = close / nz(ta.sma(close, 50), close) - 1.0
     _s20     = close / nz(ta.sma(close, 20), close) - 1.0
-    _st = "ranging"   _bi = "neutral"   _c = 0   _ch = 0
+    _st  = "ranging"
+    _bi  = "neutral"
+    _c   = 0
+    _ch  = 0
     _ch += 1
     if _vr > 1.8
         _st := "chaotic"
@@ -295,7 +298,12 @@ var int    PB_TOTAL = 0
 var float  PB_ZONE_PRICE = float(na)
 
 f_phase_b(bool atZone, float nearestZone) =>
-    _sw  = false   _dir = "none"   _dep = 0.0   _typ = "none"   _c = 0   _ch = 0
+    _sw  = false
+    _dir = "none"
+    _dep = 0.0
+    _typ = "none"
+    _c   = 0
+    _ch  = 0
     _zp  = nearestZone
 
     _sw_h = ta.pivothigh(high, i_st_piv_len, i_st_piv_len)
@@ -311,7 +319,10 @@ f_phase_b(bool atZone, float nearestZone) =>
         _sw := true   _dir := "long"   _dep := _sw_l - low
         _typ := _typ == "zone_high_sweep" ? "both" : "zone_low_sweep"   _c += 1
 
-    _eqh_cnt = 0   _eqh_p = 0.0   _eql_cnt = 0   _eql_p = 0.0
+    _eqh_cnt = 0
+    _eqh_p   = 0.0
+    _eql_cnt = 0
+    _eql_p   = 0.0
     _ch += 1
     for _i = 0 to i_lq_mem
         for _j = _i + 1 to i_lq_mem
@@ -369,10 +380,21 @@ var int    CN_PASS   = 0
 var int    CN_CHECKS = 0
 
 f_phase_c() =>
-    _fvg=false  _fd="none"  _ifvg=false  _id="none"  _ob=false  _od="none"
-    _cdl=false  _ct="none"  _str=false   _sd="none"
-    _vol=false  _eff=false  _sess=false
-    _pass=0     _checks=0
+    _fvg   = false
+    _fd    = "none"
+    _ifvg  = false
+    _id    = "none"
+    _ob    = false
+    _od    = "none"
+    _cdl   = false
+    _ct    = "none"
+    _str   = false
+    _sd    = "none"
+    _vol   = false
+    _eff   = false
+    _sess  = false
+    _pass  = 0
+    _checks = 0
 
     _checks += 1
     if i_cn_fvg
@@ -440,7 +462,8 @@ f_phase_c() =>
         else if CUR_SESS=="Asian"
             _pass+=1
 
-    _bulls=0  _bears=0
+    _bulls = 0
+    _bears = 0
     if _fd=="bull"  _bulls+=1
     if _fd=="bear"  _bears+=1
     if _id=="bull"  _bulls+=1
@@ -477,8 +500,14 @@ var bool   T_VLD = false
 f_calc_entry() =>
     _atr   = ATR_14
     _dir   = CN_DIR
-    _entry = float(na)   _sl=float(na)   _tp1=float(na)   _tp2=float(na)   _tp3=float(na)
-    _score = 0.0   _grade="none"   _valid=false
+    _entry = float(na)
+    _sl    = float(na)
+    _tp1   = float(na)
+    _tp2   = float(na)
+    _tp3   = float(na)
+    _score = 0.0
+    _grade = "none"
+    _valid = false
 
     // NEW GATE: signal only fires if price is actually AT a heatmap zone
     _ok = CN_PASS >= i_cn_min_check
