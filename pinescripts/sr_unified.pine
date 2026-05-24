@@ -424,25 +424,37 @@ f_phase_c() =>
     _checks += 1
     if i_cn_fvg
         if not na(low[1]) and not na(high[2]) and low[1] > high[2]
-            _fvg:=true  _fd:="bull"  _pass+=1
+            _fvg  := true
+            _fd   := "bull"
+            _pass += 1
         if not na(high[1]) and not na(low[2]) and high[1] < low[2]
-            _fvg:=true  _fd:="bear"  _pass+=1
+            _fvg  := true
+            _fd   := "bear"
+            _pass += 1
 
     _checks += 1
     if i_cn_ifvg
         if not na(low[2]) and not na(high[3]) and low[2] > high[3]
             if close >= high[3] and close <= low[2]
-                _ifvg:=true  _id:="bull"  _pass+=1
+                _ifvg := true
+                _id   := "bull"
+                _pass += 1
         if not na(high[2]) and not na(low[3]) and high[2] < low[3]
             if close >= high[2] and close <= low[3]
-                _ifvg:=true  _id:="bear"  _pass+=1
+                _ifvg := true
+                _id   := "bear"
+                _pass += 1
 
     _checks += 1
     if i_cn_ob
         if close>close[1] and close[1]>close[2] and close[2]>close[3] and close[3]<open[3]
-            _ob:=true  _od:="bull"  _pass+=1
+            _ob   := true
+            _od   := "bull"
+            _pass += 1
         if close<close[1] and close[1]<close[2] and close[2]<close[3] and close[3]>open[3]
-            _ob:=true  _od:="bear"  _pass+=1
+            _ob   := true
+            _od   := "bear"
+            _pass += 1
 
     _checks += 1
     if i_cn_candle
