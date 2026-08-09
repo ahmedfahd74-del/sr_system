@@ -1,0 +1,1830 @@
+//@version=6
+//@description Institutional Engine v6 — Pine port of the Freebuff trading-intelligence platform core. Mirrors the TypeScript engines: structure (E1), trend (E2), bias (E3), liquidity (E4), levels (E5), volume profile (E6), VWAP (E7), order blocks (E8), FVGs (E9), regime (E13), entries (Part 6), stops (E17), targets (E18), scoring (E21), filters (Part 9), risk/sizing (E19/E20).
+//@author Freebuff
+
+strategy(
+     "Institutional Engine v6 [Freebuff]",
+     "ITE v6",
+     overlay = true,
+     initial_capital = 100000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.012,
+     slippage = 2,
+     pyramiding = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = false,
+     use_bar_magnifier = false,
+     max_labels_count = 500,
+     max_lines_count = 500,
+     max_boxes_count = 200
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 0 · INPUTS — every threshold is config-driven, mirroring config/default.json
+// ─────────────────────────────────────────────────────────────────────────────
+grpStruct = "1 · Structure"
+kPiv      = input.int(2, "Pivot strength (bars, left=right)", 1, 10, 1, group = grpStruct)
+tauFrac   = input.float(0.25, "HH/HL tolerance (×ATR)", 0.05, 1.0, 0.05, group = grpStruct)
+bosBuf    = input.float(0.25, "BOS/CHoCH buffer (×ATR)", 0.0, 1.0, 0.05, group = grpStruct)
+maxAgeB   = input.int(90, "Level / pool max age (bars)", 20, 300, 5, group = grpStruct)
+
+grpTrend  = "2 · Trend"
+atrP      = input.int(14, "ATR period", 5, 50, 1, group = grpTrend)
+emaF      = input.int(20, "EMA fast", 5, 100, 1, group = grpTrend)
+emaM      = input.int(50, "EMA mid", 10, 200, 1, group = grpTrend)
+emaS      = input.int(200, "EMA slow", 50, 500, 5, group = grpTrend)
+adxP      = input.int(14, "ADX period", 5, 50, 1, group = grpTrend)
+adxT      = input.float(25, "ADX trend threshold", 10, 60, 1, group = grpTrend)
+adxR      = input.float(20, "ADX range threshold", 10, 60, 1, group = grpTrend)
+regB      = input.int(50, "Regression bars", 10, 200, 5, group = grpTrend)
+momB      = input.int(8, "Momentum bars", 2, 50, 1, group = grpTrend)
+wSwing    = input.float(0.22, "Weight · swing structure", 0.0, 1.0, 0.01, group = grpTrend)
+wEma      = input.float(0.16, "Weight · EMA", 0.0, 1.0, 0.01, group = grpTrend)
+wVol      = input.float(0.08, "Weight · volume", 0.0, 1.0, 0.01, group = grpTrend)
+wMom      = input.float(0.10, "Weight · momentum", 0.0, 1.0, 0.01, group = grpTrend)
+wAdx      = input.float(0.04, "Weight · ADX", 0.0, 1.0, 0.01, group = grpTrend)
+wReg      = input.float(0.04, "Weight · regression", 0.0, 1.0, 0.01, group = grpTrend)
+wVwap     = input.float(0.08, "Weight · VWAP", 0.0, 1.0, 0.01, group = grpTrend)
+wDelta    = input.float(0.10, "Weight · delta", 0.0, 1.0, 0.01, group = grpTrend)
+wAuc      = input.float(0.06, "Weight · auction", 0.0, 1.0, 0.01, group = grpTrend)
+wProf     = input.float(0.02, "Weight · profile", 0.0, 1.0, 0.01, group = grpTrend)
+wVolS     = input.float(0.04, "Weight · volatility", 0.0, 1.0, 0.01, group = grpTrend)
+
+grpVwap   = "3 · VWAP"
+vwapAnc   = input.string("D", "VWAP anchor", options = ["D", "W", "M", "NONE"], group = grpVwap)
+vwapDevN  = input.int(2, "Deviation bands (σ)", 0, 4, 1, group = grpVwap)
+
+grpVP     = "4 · Volume profile"
+vpLb      = input.int(200, "Lookback (bars)", 50, 500, 10, group = grpVP)
+vaPct     = input.float(70, "Value area %", 50, 90, 5, group = grpVP)
+binFrac   = input.float(0.2, "Bin width (×ATR)", 0.05, 0.5, 0.05, group = grpVP)
+hvnSig    = input.float(1.0, "HVN sigma", 0.5, 3.0, 0.25, group = grpVP)
+lvnSig    = input.float(1.0, "LVN sigma", 0.5, 3.0, 0.25, group = grpVP)
+
+grpLevels = "5 · Levels"
+roundStep = input.float(0.0, "Round-number step (0 = off)", 0.0, 100.0, 0.5, group = grpLevels)
+showLevels = input.bool(true, "Draw PDH/PDL · PWH/PWL · PMH/PML · opens", group = grpLevels)
+
+grpLiq    = "6 · Liquidity"
+sweepLb   = input.int(100, "Sweep scan lookback", 20, 300, 10, group = grpLiq)
+
+grpBias   = "7 · Bias ladder (HTF)"
+tfA       = input.timeframe("W", "Ladder TF 1 (highest)", group = grpBias)
+tfB       = input.timeframe("D", "Ladder TF 2", group = grpBias)
+tfC       = input.timeframe("240", "Ladder TF 3", group = grpBias)
+tfD       = input.timeframe("60", "Ladder TF 4", group = grpBias)
+
+grpScore  = "8 · Scoring (A+++ framework)"
+sTrend    = input.float(1.0, "Weight · trend", 0.0, 2.0, 0.1, group = grpScore)
+sStruct   = input.float(1.0, "Weight · structure", 0.0, 2.0, 0.1, group = grpScore)
+sLiq      = input.float(1.0, "Weight · liquidity", 0.0, 2.0, 0.1, group = grpScore)
+sVol      = input.float(1.0, "Weight · volume", 0.0, 2.0, 0.1, group = grpScore)
+sDelta    = input.float(1.0, "Weight · delta", 0.0, 2.0, 0.1, group = grpScore)
+sVwap     = input.float(1.0, "Weight · VWAP", 0.0, 2.0, 0.1, group = grpScore)
+sVP       = input.float(1.0, "Weight · volume profile", 0.0, 2.0, 0.1, group = grpScore)
+sRegime   = input.float(1.0, "Weight · regime", 0.0, 2.0, 0.1, group = grpScore)
+sRR       = input.float(1.0, "Weight · risk/reward", 0.0, 2.0, 0.1, group = grpScore)
+sSession  = input.float(1.0, "Weight · session", 0.0, 2.0, 0.1, group = grpScore)
+minExec   = input.int(70, "Min score · execute", 0, 100, 1, group = grpScore)
+idealSc   = input.int(85, "Ideal score", 0, 100, 1, group = grpScore)
+autoRej   = input.int(55, "Auto-reject floor", 0, 100, 1, group = grpScore)
+minRR     = input.float(1.5, "Min R:R (trend setups)", 0.5, 5.0, 0.1, group = grpScore)
+minRRRev  = input.float(2.0, "Min R:R (reversal setups)", 0.5, 5.0, 0.1, group = grpScore)
+
+grpRisk   = "9 · Risk & execution"
+riskPct   = input.float(1.0, "Risk per trade (%)", 0.1, 5.0, 0.1, group = grpRisk)
+deferB    = input.int(12, "Re-entry lockout (bars)", 0, 100, 1, group = grpRisk)
+maxDayT   = input.int(4, "Max trades / day", 1, 20, 1, group = grpRisk)
+cbLoss    = input.int(3, "Circuit breaker · consecutive losses", 1, 10, 1, group = grpRisk)
+cbPause   = input.int(20, "Circuit breaker pause (bars)", 5, 100, 5, group = grpRisk)
+enStrat   = input.bool(true, "Enable strategy execution", group = grpRisk)
+
+grpDisp   = "10 · Display"
+showSwings = input.bool(true, "Swing labels", group = grpDisp)
+showEvents = input.bool(true, "BOS/CHoCH markers + levels", group = grpDisp)
+showVwapD  = input.bool(true, "VWAP + σ bands", group = grpDisp)
+showVpD    = input.bool(true, "Volume profile (POC/VA/HVN/LVN)", group = grpDisp)
+showPools  = input.bool(true, "Liquidity pools + sweeps", group = grpDisp)
+showFvg    = input.bool(true, "FVG zones", group = grpDisp)
+showOb     = input.bool(true, "Order blocks", group = grpDisp)
+showSetups = input.bool(true, "Setup box + stop/targets", group = grpDisp)
+showTable  = input.bool(true, "Info table", group = grpDisp)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1 · HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+clampF(v, lo, hi) =>
+    math.max(lo, math.min(hi, v))
+
+notSame(a, b) =>
+    na(a) or math.abs(a - b) > syminfo.mintick
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2 · STRUCTURE STATE (pure, var-free — safe inside request.security)
+//    1 = UPTREND · -1 = DOWNTREND · 0 = RANGE · 2 = insufficient data (FLAT)
+// ─────────────────────────────────────────────────────────────────────────────
+calcState() =>
+    kph = ta.pivothigh(high, kPiv, kPiv)
+    kpl = ta.pivotlow(low, kPiv, kPiv)
+    psh1 = ta.valuewhen(not na(kph), kph, 0)
+    psh2 = ta.valuewhen(not na(kph), kph, 1)
+    psl1 = ta.valuewhen(not na(kpl), kpl, 0)
+    psl2 = ta.valuewhen(not na(kpl), kpl, 1)
+    tauS = math.max(tauFrac * nz(ta.atr(atrP), 1), syminfo.mintick)
+    haveP = not na(psh1) and not na(psh2) and not na(psl1) and not na(psl2)
+    st = 2
+    if not na(psh1) and not na(psl1)
+        if haveP and psh1 - psh2 >= tauS and psl1 - psl2 >= tauS
+            st := 1
+        else if haveP and psh2 - psh1 >= tauS and psl2 - psl1 >= tauS
+            st := -1
+        else
+            st := 0
+    st
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3 · TREND SENSORS (pure, var-free) — mirrors trend.ts S1/S2/S3/S8/S10/S11/S5
+//    Returns [dirs, strengths, weights, adx, atr]
+// ─────────────────────────────────────────────────────────────────────────────
+calcTrendSensors() =>
+    atrX = ta.atr(atrP)
+    atrS = nz(atrX, 1)
+    e20 = ta.ema(close, emaF)
+    e50 = ta.ema(close, emaM)
+    e200 = ta.ema(close, emaS)
+    // S1 — swing structure
+    kph = ta.pivothigh(high, kPiv, kPiv)
+    kpl = ta.pivotlow(low, kPiv, kPiv)
+    psh1 = ta.valuewhen(not na(kph), kph, 0)
+    psh2 = ta.valuewhen(not na(kph), kph, 1)
+    psl1 = ta.valuewhen(not na(kpl), kpl, 0)
+    psl2 = ta.valuewhen(not na(kpl), kpl, 1)
+    tauS = math.max(tauFrac * atrS, syminfo.mintick)
+    swingDir = 0
+    swingStr = 0.0
+    if not na(psh1) and not na(psh2) and not na(psl1) and not na(psl2)
+        upCnt = 0
+        dnCnt = 0
+        if psh1 - psh2 >= tauS
+            upCnt += 1
+        if psh2 - psh1 >= tauS
+            dnCnt += 1
+        if psl1 - psl2 >= tauS
+            upCnt += 1
+        if psl2 - psl1 >= tauS
+            dnCnt += 1
+        swingDir := upCnt > dnCnt ? 1 : dnCnt > upCnt ? -1 : 0
+        swingStr := clampF(math.abs(upCnt - dnCnt) / 2.0, 0, 1)
+    // S2 — EMA trend
+    emaDir = 0
+    if not na(e50) and not na(e200)
+        if close > e50 and e50 > e200
+            emaDir := 1
+        else if close < e50 and e50 < e200
+            emaDir := -1
+        if not na(e20)
+            if e20 > e50 and emaDir != 0
+                emaDir := 1
+            if e20 < e50 and emaDir != 0
+                emaDir := -1
+    emaDist = not na(e50) ? clampF(math.abs(close - e50) / math.max(atrS, 1e-9) / 2.0, 0, 1) : 0.0
+    emaSlopeV = not na(e50) and not na(e50[5]) ? clampF(math.abs(e50 - e50[5]) / math.max(atrS, 1e-9) / 2.0, 0, 1) : 0.0
+    emaStr = 0.6 * emaDist + 0.4 * emaSlopeV
+    // S3 — volume trend
+    upVol = 0.0
+    dnVol = 0.0
+    for vi = 0 to 19
+        if close[vi] >= open[vi]
+            upVol += volume[vi]
+        else
+            dnVol += volume[vi]
+    volRatio = dnVol > 0 ? upVol / dnVol : upVol > 0 ? 10.0 : 1.0
+    volDir = volRatio > 1.15 ? 1 : volRatio < 0.87 ? -1 : 0
+    volStr = clampF(math.abs(math.log(volRatio)) / math.log(1.5), 0, 1)
+    // S8 — momentum (normalized by ATR·√bars, mirrors trend.ts)
+    mom = (close - close[momB]) / math.max(atrS * math.sqrt(momB), 1e-9)
+    momDir = mom > 0.05 ? 1 : mom < -0.05 ? -1 : 0
+    momStr = clampF(math.abs(mom) / 2.0, 0, 1)
+    // S10 — ADX / DMI
+    [plusDi, minusDi, adxX] = ta.dmi(adxP, adxP)
+    adxD = adxX >= adxT ? (plusDi > minusDi ? 1 : -1) : 0
+    adxStr = clampF((adxX - adxR) / 20.0, 0, 1)
+    // S11 — regression slope (linreg delta ≈ per-bar slope; r² ≈ corr²)
+    regSlope = ta.linreg(close, regB, 0) - ta.linreg(close, regB, 1)
+    r2S = math.pow(ta.correlation(close, bar_index, regB), 2)
+    slopeAtr = regSlope * regB / atrS
+    regDir = regSlope > 1e-9 ? 1 : regSlope < -1e-9 ? -1 : 0
+    regStr = clampF(math.abs(slopeAtr) / 3.0, 0, 1) * (0.5 + 0.5 * r2S)
+    // S5 — VWAP sensor (running VWAP from context start, sigma-normalized)
+    tpV = hlc3
+    cumPV = ta.cum(tpV * volume)
+    cumV = ta.cum(volume)
+    cumP2 = ta.cum(tpV * tpV * volume)
+    vwapX = cumV > 0 ? cumPV / cumV : na
+    varX = cumV > 0 ? math.max(cumP2 / cumV - vwapX * vwapX, 0) : 0.0
+    sigX = math.sqrt(varX)
+    vwapDev = sigX > 0 and not na(vwapX) ? (close - vwapX) / sigX : 0.0
+    vwapDir = vwapDev > 0.1 ? 1 : vwapDev < -0.1 ? -1 : 0
+    vwapStr = clampF(math.abs(vwapDev) / 2.0, 0, 1)
+    dirs = array.from(swingDir, emaDir, volDir, momDir, adxD, regDir, vwapDir)
+    strs = array.from(swingStr, emaStr, volStr, momStr, adxStr, regStr, vwapStr)
+    wts = array.from(wSwing, wEma, wVol, wMom, wAdx, wReg, wVwap)
+    [dirs, strs, wts, adxX, atrS]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4 · TREND COMBINATION (mirrors trend.ts Rule 5.13: weighted directional sum,
+//    agreement gating, ADX range halving, swing-vs-EMA contradiction gate)
+// ─────────────────────────────────────────────────────────────────────────────
+combineTrend(dirs, strs, wts, adxX) =>
+    n = array.size(wts)
+    totalW = 0.0
+    for i = 0 to n - 1
+        totalW += array.get(wts, i)
+    dirSum = 0.0
+    for i = 0 to n - 1
+        dirSum += array.get(wts, i) * array.get(dirs, i)
+    rawDir = dirSum > 0.02 ? 1 : dirSum < -0.02 ? -1 : 0
+    score = 0.0
+    for i = 0 to n - 1
+        score += array.get(wts, i) * array.get(strs, i)
+    agree = 0.0
+    if rawDir != 0 and totalW > 0
+        for i = 0 to n - 1
+            if array.get(dirs, i) == rawDir
+                agree += array.get(wts, i)
+        agree := agree / totalW
+    score := score * (0.6 + 0.4 * agree)
+    if adxX < adxR
+        score := score * 0.5
+    if n >= 7
+        swD = array.get(dirs, 0)
+        emD = array.get(dirs, 1)
+        moS = array.get(strs, 3)
+        if swD != 0 and emD != 0 and swD != emD and moS < 0.3
+            score := score * 0.6
+    [clampF(score * 100.0, 0, 100), rawDir, agree]
+
+// HTF full analysis: [structureState, trendScore, trendDir, agreement, adx]
+calcFullAnalysis() =>
+    [dirs, strs, wts, adxX, atrX] = calcTrendSensors()
+    st = calcState()
+    [score, dir, agree] = combineTrend(dirs, strs, wts, adxX)
+    [st, score, dir, agree, adxX]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5 · GLOBAL SERIES — ATR, volatility rank, pivots, swings
+// ─────────────────────────────────────────────────────────────────────────────
+atrVal = ta.atr(atrP)
+atrS = nz(atrVal, 1)
+
+var array<float> atrHist = array.new_float()
+
+// ATR percentile rank of the current value within its trailing window (mirrors
+// indicators.percentileRank: counts values below the last value, window excludes it)
+calcAtrRank() =>
+    n = array.size(atrHist)
+    if n < 3
+        50.0
+    else
+        cur = array.get(atrHist, n - 1)
+        cnt = 0.0
+        for i = 0 to n - 2
+            if array.get(atrHist, i) < cur
+                cnt += 1.0
+        cnt * 100.0 / (n - 1)
+
+atrHist.push(atrS)
+if array.size(atrHist) > 100
+    array.shift(atrHist)
+atrRank = calcAtrRank()
+
+// swings (pivot value appears at confirmation bar = pivot bar + kPiv; pivot bar = bar_index - kPiv)
+ph = ta.pivothigh(high, kPiv, kPiv)
+pl = ta.pivotlow(low, kPiv, kPiv)
+
+sh1 = ta.valuewhen(not na(ph), ph, 0)
+sh2 = ta.valuewhen(not na(ph), ph, 1)
+sl1 = ta.valuewhen(not na(pl), pl, 0)
+sl2 = ta.valuewhen(not na(pl), pl, 1)
+sh1Bar = ta.valuewhen(not na(ph), bar_index - kPiv, 0)
+sh2Bar = ta.valuewhen(not na(ph), bar_index - kPiv, 1)
+sl1Bar = ta.valuewhen(not na(pl), bar_index - kPiv, 0)
+sl2Bar = ta.valuewhen(not na(pl), bar_index - kPiv, 1)
+
+tau = math.max(tauFrac * atrS, syminfo.mintick)
+havePh2 = not na(sh1) and not na(sh2)
+havePl2 = not na(sl1) and not na(sl2)
+hh = havePh2 and sh1 - sh2 >= tau
+lh = havePh2 and sh2 - sh1 >= tau
+hl = havePl2 and sl1 - sl2 >= tau
+ll = havePl2 and sl2 - sl1 >= tau
+eqh = havePh2 and math.abs(sh1 - sh2) < tau
+eql = havePl2 and math.abs(sl1 - sl2) < tau
+upTrend = hh and hl
+downTrend = lh and ll
+
+// swing history (for pools, measured moves, opposing structure, retests)
+var array<float> swPx = array.new_float()
+var array<string> swTy = array.new_string()
+var array<int> swBar = array.new_int()
+if not na(ph)
+    array.push(swPx, ph)
+    array.push(swTy, "H")
+    array.push(swBar, bar_index - kPiv)
+    if array.size(swPx) > 40
+        array.shift(swPx)
+        array.shift(swTy)
+        array.shift(swBar)
+if not na(pl)
+    array.push(swPx, pl)
+    array.push(swTy, "L")
+    array.push(swBar, bar_index - kPiv)
+    if array.size(swPx) > 40
+        array.shift(swPx)
+        array.shift(swTy)
+        array.shift(swBar)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6 · STRUCTURE STATE MACHINE + BOS/CHoCH (mirrors structure.ts detectEvents)
+// ─────────────────────────────────────────────────────────────────────────────
+var string stState = "RANGE"
+var string stTransDir = ""
+var int stLastEventBar = -999999
+var float lastChochDown = na
+var float lastBosUp = na
+var float lastChochUp = na
+var float lastBosDown = na
+
+var float bosUpMark = na
+var float bosDownMark = na
+var float chochUpMark = na
+var float chochDownMark = na
+
+var array<line> evLines = array.new_line()
+
+deltaB = bosBuf * atrS
+newestSwingBar = math.max(nz(sh1Bar, -999999), nz(sl1Bar, -999999))
+newSwingSinceEvent = newestSwingBar > stLastEventBar
+
+bosUpMark := na
+bosDownMark := na
+chochUpMark := na
+chochDownMark := na
+
+if stState != "TRANSITION"
+    if stState == "UPTREND" and downTrend and newSwingSinceEvent
+        stState := "DOWNTREND"
+    else if stState == "DOWNTREND" and upTrend and newSwingSinceEvent
+        stState := "UPTREND"
+    else if (stState == "RANGE" or stState == "FLAT") and (upTrend or downTrend)
+        stState := upTrend ? "UPTREND" : "DOWNTREND"
+
+if stState == "UPTREND" or (stState == "TRANSITION" and stTransDir == "UP")
+    if not na(sl1) and close < sl1 - deltaB
+        if notSame(lastChochDown, sl1)
+            chochDownMark := sl1
+            stState := "TRANSITION"
+            stTransDir := "DOWN"
+            stLastEventBar := bar_index
+            lastChochDown := sl1
+            if showEvents
+                evL = line.new(bar_index, sl1, bar_index, sl1, extend = extend.right, color = color.new(color.orange, 0), style = line.style_dotted, width = 1)
+                array.push(evLines, evL)
+    else if not na(sh1) and close > sh1 + deltaB
+        if notSame(lastBosUp, sh1)
+            bosUpMark := sh1
+            stState := "UPTREND"
+            stTransDir := ""
+            stLastEventBar := bar_index
+            lastBosUp := sh1
+            if showEvents
+                evL = line.new(bar_index, sh1, bar_index, sh1, extend = extend.right, color = color.new(color.green, 0), style = line.style_dashed, width = 1)
+                array.push(evLines, evL)
+else if stState == "DOWNTREND" or (stState == "TRANSITION" and stTransDir == "DOWN")
+    if not na(sh1) and close > sh1 + deltaB
+        if notSame(lastChochUp, sh1)
+            chochUpMark := sh1
+            stState := "TRANSITION"
+            stTransDir := "UP"
+            stLastEventBar := bar_index
+            lastChochUp := sh1
+            if showEvents
+                evL = line.new(bar_index, sh1, bar_index, sh1, extend = extend.right, color = color.new(color.aqua, 0), style = line.style_dotted, width = 1)
+                array.push(evLines, evL)
+    else if not na(sl1) and close < sl1 - deltaB
+        if notSame(lastBosDown, sl1)
+            bosDownMark := sl1
+            stState := "DOWNTREND"
+            stTransDir := ""
+            stLastEventBar := bar_index
+            lastBosDown := sl1
+            if showEvents
+                evL = line.new(bar_index, sl1, bar_index, sl1, extend = extend.right, color = color.new(color.red, 0), style = line.style_dashed, width = 1)
+                array.push(evLines, evL)
+else if stState == "TRANSITION" and stTransDir == "DOWN"
+    if not na(sl2) and close < sl2 - deltaB
+        if notSame(lastBosDown, sl2)
+            bosDownMark := sl2
+            stState := "DOWNTREND"
+            stTransDir := ""
+            stLastEventBar := bar_index
+            lastBosDown := sl2
+            if showEvents
+                evL = line.new(bar_index, sl2, bar_index, sl2, extend = extend.right, color = color.new(color.red, 0), style = line.style_dashed, width = 1)
+                array.push(evLines, evL)
+else if stState == "TRANSITION" and stTransDir == "UP"
+    if not na(sh2) and close > sh2 + deltaB
+        if notSame(lastBosUp, sh2)
+            bosUpMark := sh2
+            stState := "UPTREND"
+            stTransDir := ""
+            stLastEventBar := bar_index
+            lastBosUp := sh2
+            if showEvents
+                evL = line.new(bar_index, sh2, bar_index, sh2, extend = extend.right, color = color.new(color.green, 0), style = line.style_dashed, width = 1)
+                array.push(evLines, evL)
+
+// prune old event lines
+if array.size(evLines) > 100
+    line.delete(array.get(evLines, 0))
+    array.shift(evLines)
+
+// swing labels at the pivot bar (drawn when the pivot confirms, kPiv bars later)
+if showSwings and not na(ph)
+    lblTxt = havePh2 ? (hh ? "HH" : lh ? "LH" : "EQH") : "S"
+    lblCol = hh ? color.green : lh ? color.red : color.gray
+    label.new(bar_index - kPiv, ph, lblTxt, style = label.style_label_down, color = color.new(lblCol, 0), textcolor = color.white, size = size.tiny)
+if showSwings and not na(pl)
+    lblTxt2 = havePl2 ? (hl ? "HL" : ll ? "LL" : "EQL") : "S"
+    lblCol2 = hl ? color.green : ll ? color.red : color.gray
+    label.new(bar_index - kPiv, pl, lblTxt2, style = label.style_label_up, color = color.new(lblCol2, 0), textcolor = color.white, size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7 · CURRENT-TF TREND ENGINE (full 11-sensor set, mirroring trend.ts)
+// ─────────────────────────────────────────────────────────────────────────────
+[tsDirs, tsStrs, tsWts, adxNow, atrNowS] = calcTrendSensors()
+
+// S4 — delta (signed-volume proxy for cumulative delta; real delta needs footprint data)
+cd = ta.cum(close >= open ? volume : -volume)
+dSlope = cd - cd[20]
+dSumVol = ta.cum(volume) - ta.cum(volume)[20]
+deltaDir = dSlope > 1e-9 ? 1 : dSlope < -1e-9 ? -1 : 0
+deltaStr = dSumVol > 0 ? clampF(math.abs(dSlope) / (0.05 * dSumVol), 0, 1) : 0.0
+
+// S9 — volatility context (non-directional)
+volDirS = 0
+volStrS = atrRank / 100.0
+
+dirsA = array.copy(tsDirs)
+strsA = array.copy(tsStrs)
+wtsA = array.copy(tsWts)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8 · ANCHORED VWAP (mirrors vwap-engine.ts: typical price, volume-weighted σ)
+// ─────────────────────────────────────────────────────────────────────────────
+var float vSumP = 0.0
+var float vSumV = 0.0
+var float vSumP2 = 0.0
+isAnchorBar = vwapAnc == "D" ? (nz(ta.change(time("D"))) != 0 or bar_index == 0) : vwapAnc == "W" ? (nz(ta.change(time("W"))) != 0 or bar_index == 0) : vwapAnc == "M" ? (nz(ta.change(time("M"))) != 0 or bar_index == 0) : bar_index == 0
+if isAnchorBar
+    vSumP := 0.0
+    vSumV := 0.0
+    vSumP2 := 0.0
+tp = hlc3
+if not na(tp) and not na(volume)
+    vSumP += tp * volume
+    vSumV += volume
+    vSumP2 += tp * tp * volume
+myVwap = vSumV > 0 ? vSumP / vSumV : na
+vwapVar = vSumV > 0 and not na(myVwap) ? math.max(vSumP2 / vSumV - myVwap * myVwap, 0) : na
+vwapSig = not na(vwapVar) ? math.sqrt(vwapVar) : na
+vwapDev = not na(myVwap) and not na(vwapSig) and vwapSig > 0 ? (close - myVwap) / vwapSig : 0.0
+vwapSlope = not na(myVwap) and not na(myVwap[10]) and not na(vwapSig) and vwapSig > 0 ? (myVwap - myVwap[10]) / (10.0 * vwapSig) : 0.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9 · VOLUME PROFILE (mirrors volume-profile.ts; incremental sorted bins)
+// ─────────────────────────────────────────────────────────────────────────────
+binW = math.max(syminfo.mintick, atrS * binFrac)
+var array<int> vpBins = array.new_int()
+var array<float> vpVols = array.new_float()
+var array<int> vpHB = array.new_int()
+var array<float> vpHV = array.new_float()
+
+curBin = int(math.round(close / binW))
+if array.size(vpHB) >= vpLb
+    ob = array.shift(vpHB)
+    ov = array.shift(vpHV)
+    oi = array.indexof(vpBins, ob)
+    if oi >= 0
+        nv = array.get(vpVols, oi) - ov
+        if nv <= 0
+            array.remove(vpBins, oi)
+            array.remove(vpVols, oi)
+        else
+            array.set(vpVols, oi, nv)
+array.push(vpHB, curBin)
+array.push(vpHV, volume)
+bi = array.indexof(vpBins, curBin)
+if bi >= 0
+    array.set(vpVols, bi, array.get(vpVols, bi) + volume)
+else
+    ins = 0
+    for i = 0 to array.size(vpBins) - 1
+        if array.get(vpBins, i) < curBin
+            ins := i + 1
+        else
+            break
+    array.insert(vpBins, ins, curBin)
+    array.insert(vpVols, ins, volume)
+
+// derive POC / VA / HVN / LVN
+nBins = array.size(vpBins)
+pocBin = -1
+pocVol = -1.0
+totalV = 0.0
+for i = 0 to nBins - 1
+    vv = array.get(vpVols, i)
+    totalV += vv
+    if vv > pocVol
+        pocVol := vv
+        pocBin := i
+pocPrice = pocBin >= 0 ? array.get(vpBins, pocBin) * binW : na
+vaLo = pocBin
+vaHi = pocBin
+accV = pocBin >= 0 ? array.get(vpVols, pocBin) : 0.0
+if nBins > 1 and pocBin >= 0
+    while accV < totalV * vaPct / 100.0 and (vaLo > 0 or vaHi < nBins - 1)
+        loV = vaLo > 0 ? array.get(vpVols, vaLo - 1) : -1.0
+        hiV = vaHi < nBins - 1 ? array.get(vpVols, vaHi + 1) : -1.0
+        if loV >= hiV and vaLo > 0
+            vaLo -= 1
+            accV += loV
+        else if vaHi < nBins - 1
+            vaHi += 1
+            accV += hiV
+        else
+            break
+vaHighP = vaHi >= 0 ? array.get(vpBins, vaHi) * binW : na
+vaLowP = vaLo >= 0 ? array.get(vpBins, vaLo) * binW : na
+// HVN / LVN via mean ± sigma
+meanV = nBins > 0 ? totalV / nBins : 0.0
+varv = 0.0
+for i = 0 to nBins - 1
+    dvv = array.get(vpVols, i) - meanV
+    varv += dvv * dvv
+varvFinal = nBins > 0 ? varv / nBins : 0.0
+sigV = math.sqrt(varvFinal)
+hvnPx = array.new_float()
+lvnPx = array.new_float()
+for i = 0 to nBins - 1
+    vv = array.get(vpVols, i)
+    if sigV > 0
+        if vv >= meanV + hvnSig * sigV and array.size(hvnPx) < 4
+            array.push(hvnPx, array.get(vpBins, i) * binW)
+        if vv <= meanV - lvnSig * sigV and array.size(lvnPx) < 4
+            array.push(lvnPx, array.get(vpBins, i) * binW)
+// single vs dual distribution (peaks count)
+peaks = 0
+for i = 1 to nBins - 2
+    if array.get(vpVols, i) > array.get(vpVols, i - 1) and array.get(vpVols, i) >= array.get(vpVols, i + 1)
+        peaks += 1
+singleDual = peaks >= 2 ? "DUAL" : "SINGLE"
+
+// profile drawings
+var line pocLine = na
+var line vaHighLine = na
+var line vaLowLine = na
+var box vaBox = na
+var array<line> hvnLines = array.new_line()
+var array<line> lvnLines = array.new_line()
+if showVpD
+    if not na(pocLine)
+        line.delete(pocLine)
+    if not na(vaHighLine)
+        line.delete(vaHighLine)
+    if not na(vaLowLine)
+        line.delete(vaLowLine)
+    for i = 0 to array.size(hvnLines) - 1
+        line.delete(array.get(hvnLines, i))
+    for i = 0 to array.size(lvnLines) - 1
+        line.delete(array.get(lvnLines, i))
+    array.clear(hvnLines)
+    array.clear(lvnLines)
+    if not na(pocPrice)
+        pocLine := line.new(bar_index, pocPrice, bar_index, pocPrice, extend = extend.right, color = color.new(color.purple, 0), style = line.style_solid, width = 2)
+    if not na(vaHighP)
+        vaHighLine := line.new(bar_index, vaHighP, bar_index, vaHighP, extend = extend.right, color = color.new(color.blue, 20), style = line.style_dashed, width = 1)
+    if not na(vaLowP)
+        vaLowLine := line.new(bar_index, vaLowP, bar_index, vaLowP, extend = extend.right, color = color.new(color.blue, 20), style = line.style_dashed, width = 1)
+    for i = 0 to array.size(hvnPx) - 1
+        array.push(hvnLines, line.new(bar_index, array.get(hvnPx, i), bar_index, array.get(hvnPx, i), extend = extend.right, color = color.new(color.teal, 40), style = line.style_solid, width = 1))
+    for i = 0 to array.size(lvnPx) - 1
+        array.push(lvnLines, line.new(bar_index, array.get(lvnPx, i), bar_index, array.get(lvnPx, i), extend = extend.right, color = color.new(color.gray, 40), style = line.style_solid, width = 1))
+    if not na(vaLowP) and not na(vaHighP) and not na(vaBox)
+        box.delete(vaBox)
+    if not na(vaLowP) and not na(vaHighP)
+        vaBox := box.new(bar_index, vaHighP, bar_index, vaLowP, border_color = color.new(color.blue, 40), bgcolor = color.new(color.blue, 92))
+
+// auction + profile trend sensors (S6, S12)
+aucDir = 0
+aucStr = 0.0
+if not na(vaHighP) and not na(vaLowP)
+    if close > vaHighP
+        aucDir := 1
+        aucStr := clampF((close - vaHighP) / math.max(atrS, 1e-9) / 1.5, 0, 1)
+    else if close < vaLowP
+        aucDir := -1
+        aucStr := clampF((vaLowP - close) / math.max(atrS, 1e-9) / 1.5, 0, 1)
+profDir = singleDual == "SINGLE" and not na(pocPrice) ? (close > pocPrice ? 1 : -1) : 0
+profStr = singleDual == "SINGLE" and not na(pocPrice) ? 0.5 : 0.0
+
+// assemble full sensor set and combine
+array.push(dirsA, deltaDir)
+array.push(strsA, deltaStr)
+array.push(wtsA, wDelta)
+array.push(dirsA, aucDir)
+array.push(strsA, aucStr)
+array.push(wtsA, wAuc)
+array.push(dirsA, profDir)
+array.push(strsA, profStr)
+array.push(wtsA, wProf)
+array.push(dirsA, volDirS)
+array.push(strsA, volStrS)
+array.push(wtsA, wVolS)
+
+[trendScore, trendDir, trendAgree] = combineTrend(dirsA, strsA, wtsA, adxNow)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10 · MARKET REGIME (mirrors regime.ts decision table)
+// ─────────────────────────────────────────────────────────────────────────────
+strongTrend = trendScore >= 60 and adxNow >= 25
+weakTrend = trendScore >= 35 and adxNow >= 20
+highVol = atrRank > 80
+regime = "RANGING"
+if strongTrend and trendDir != 0
+    regime := trendDir == 1 ? "TRENDING_UP" : "TRENDING_DOWN"
+else if weakTrend and trendDir != 0 and highVol
+    regime := "HIGH_VOL_BREAKOUT"
+else if atrRank > 97
+    regime := "CRISIS"
+else if weakTrend and trendDir != 0
+    regime := trendDir == 1 ? "TRENDING_UP" : "TRENDING_DOWN"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11 · INSTITUTIONAL LEVELS — PDH/PDL · PWH/PWL · PMH/PML · opens
+//     PDH-style levels use the documented no-repaint pattern
+//     (lookahead_on + high[1]/low[1] → previous period, fixed once complete).
+//     Period opens are tracked locally at period boundaries (no leak).
+// ─────────────────────────────────────────────────────────────────────────────
+[pdhX, pdlX] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwhX, pwlX] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pmhX, pmlX] = request.security(syminfo.tickerid, "M", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+pdh = nz(pdhX)
+pdl = nz(pdlX)
+pwh = nz(pwhX)
+pwl = nz(pwlX)
+pmh = nz(pmhX)
+pml = nz(pmlX)
+
+var float dayOpen = na
+var float weekOpen = na
+var float monOpen = na
+if nz(ta.change(time("D"))) != 0
+    dayOpen := open
+if nz(ta.change(time("W"))) != 0
+    weekOpen := open
+if nz(ta.change(time("M"))) != 0
+    monOpen := open
+if na(dayOpen)
+    dayOpen := open
+if na(weekOpen)
+    weekOpen := open
+if na(monOpen)
+    monOpen := open
+dOpen = dayOpen
+wOpen = weekOpen
+mOpen = monOpen
+
+// role reversal: a strong swing level broken by a close-through flips side
+// (levels.ts evaluateState: BROKEN → reversed when strength >= 45)
+var array<float> revPx = array.new_float()
+var array<string> revTy = array.new_string()
+array.clear(revPx)
+array.clear(revTy)
+for i = 0 to array.size(swPx) - 1
+    lv = array.get(swPx, i)
+    lvBar = array.get(swBar, i)
+    lvTy = array.get(swTy, i)
+    broken = false
+    for j = lvBar + 1 to math.min(bar_index, lvBar + maxAgeB)
+        if lvTy == "H"
+            if close[j] > lv + 0.25 * atrS
+                broken := true
+                break
+        else
+            if close[j] < lv - 0.25 * atrS
+                broken := true
+                break
+    if broken
+        array.push(revPx, lv)
+        array.push(revTy, lvTy == "H" ? "S" : "R")
+
+// level lines (recreated each bar; only drawn when enabled)
+var array<line> lvlLines = array.new_line()
+if showLevels
+    for i = 0 to array.size(lvlLines) - 1
+        line.delete(array.get(lvlLines, i))
+    array.clear(lvlLines)
+    if pdh > 0
+        array.push(lvlLines, line.new(bar_index, pdh, bar_index, pdh, extend = extend.right, color = color.new(color.teal, 30), style = line.style_dashed, width = 1))
+    if pdl > 0
+        array.push(lvlLines, line.new(bar_index, pdl, bar_index, pdl, extend = extend.right, color = color.new(color.teal, 30), style = line.style_dashed, width = 1))
+    if pwh > 0
+        array.push(lvlLines, line.new(bar_index, pwh, bar_index, pwh, extend = extend.right, color = color.new(color.blue, 30), style = line.style_dashed, width = 1))
+    if pwl > 0
+        array.push(lvlLines, line.new(bar_index, pwl, bar_index, pwl, extend = extend.right, color = color.new(color.blue, 30), style = line.style_dashed, width = 1))
+    if pmh > 0
+        array.push(lvlLines, line.new(bar_index, pmh, bar_index, pmh, extend = extend.right, color = color.new(color.gray, 30), style = line.style_dashed, width = 1))
+    if pml > 0
+        array.push(lvlLines, line.new(bar_index, pml, bar_index, pml, extend = extend.right, color = color.new(color.gray, 30), style = line.style_dashed, width = 1))
+    if not na(dOpen)
+        array.push(lvlLines, line.new(bar_index, dOpen, bar_index, dOpen, extend = extend.right, color = color.new(color.orange, 40), style = line.style_dotted, width = 1))
+    if not na(wOpen)
+        array.push(lvlLines, line.new(bar_index, wOpen, bar_index, wOpen, extend = extend.right, color = color.new(color.orange, 50), style = line.style_dotted, width = 1))
+    if not na(mOpen)
+        array.push(lvlLines, line.new(bar_index, mOpen, bar_index, mOpen, extend = extend.right, color = color.new(color.orange, 60), style = line.style_dotted, width = 1))
+    // round numbers near price (strength 35 — display only, mirrors levels.ts)
+    if roundStep > 0
+        rLo = math.floor((close - 3 * atrS) / roundStep) * roundStep
+        rHi = math.ceil((close + 3 * atrS) / roundStep) * roundStep
+        r = rLo
+        while r <= rHi
+            if r != 0
+                array.push(lvlLines, line.new(bar_index, r, bar_index, r, extend = extend.right, color = color.new(color.gray, 75), style = line.style_solid, width = 1))
+            r += roundStep
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12 · LIQUIDITY POOLS + SWEEPS (mirrors liquidity.ts: cluster swing extremes,
+//     equal highs/lows + extras; sweep = wick-through + close-back)
+// ─────────────────────────────────────────────────────────────────────────────
+tol = math.max(tauFrac * atrS, syminfo.mintick)
+var array<float> poolPx = array.new_float()
+var array<string> poolSide = array.new_string()
+var array<int> poolDepth = array.new_int()
+array.clear(poolPx)
+array.clear(poolSide)
+array.clear(poolDepth)
+
+lvList = array.new_float()
+for i = 0 to array.size(swPx) - 1
+    array.push(lvList, array.get(swPx, i))
+array.push(lvList, pdh)
+array.push(lvList, pdl)
+array.push(lvList, pwh)
+array.push(lvList, pwl)
+array.push(lvList, pmh)
+array.push(lvList, pml)
+array.sort(lvList)
+for i = 0 to array.size(lvList) - 1
+    p = array.get(lvList, i)
+    if p <= 0
+        continue
+    if array.size(poolPx) > 0 and math.abs(array.get(poolPx, array.size(poolPx) - 1) - p) <= tol
+        lastI = array.size(poolPx) - 1
+        cnt = array.get(poolDepth, lastI) + 1
+        array.set(poolPx, lastI, (array.get(poolPx, lastI) + p) / 2.0)
+        array.set(poolDepth, lastI, cnt)
+    else
+        array.push(poolPx, p)
+        array.push(poolSide, p > close ? "ABOVE" : "BELOW")
+        array.push(poolDepth, 1)
+// equal highs / lows
+for i = 1 to array.size(swPx) - 1
+    if array.get(swTy, i) == array.get(swTy, i - 1) and math.abs(array.get(swPx, i) - array.get(swPx, i - 1)) <= tol
+        mid = (array.get(swPx, i) + array.get(swPx, i - 1)) / 2.0
+        dup = false
+        for k = 0 to array.size(poolPx) - 1
+            if math.abs(array.get(poolPx, k) - mid) <= tol
+                dup := true
+                break
+        if not dup
+            array.push(poolPx, mid)
+            array.push(poolSide, mid > close ? "ABOVE" : "BELOW")
+            array.push(poolDepth, 2)
+// keep the 12 pools nearest to price
+nPool = array.size(poolPx)
+if nPool > 12
+    tPx = array.new_float()
+    tSide = array.new_string()
+    tDep = array.new_int()
+    for i = 0 to nPool - 1
+        px = array.get(poolPx, i)
+        d = math.abs(px - close)
+        ins = 0
+        for j = 0 to array.size(tPx) - 1
+            if math.abs(array.get(tPx, j) - close) < d
+                ins := j + 1
+            else
+                break
+        array.insert(tPx, ins, px)
+        array.insert(tSide, ins, array.get(poolSide, i))
+        array.insert(tDep, ins, array.get(poolDepth, i))
+    array.clear(poolPx)
+    array.clear(poolSide)
+    array.clear(poolDepth)
+    for i = 0 to math.min(11, array.size(tPx) - 1)
+        array.push(poolPx, array.get(tPx, i))
+        array.push(poolSide, array.get(tSide, i))
+        array.push(poolDepth, array.get(tDep, i))
+
+// sweep scan: any pool swept (wick through + close back) in the last `sweepLb` bars
+var array<float> sweepPx = array.new_float()
+var array<string> sweepDir = array.new_string()
+var array<int> sweepBar = array.new_int()
+array.clear(sweepPx)
+array.clear(sweepDir)
+array.clear(sweepBar)
+sweptSet = array.new_float()
+for i = 0 to array.size(poolPx) - 1
+    pp = array.get(poolPx, i)
+    swept = false
+    for j = 1 to math.min(sweepLb, bar_index)
+        hhJ = high[j]
+        llJ = low[j]
+        ccJ = close[j]
+        if hhJ > pp and ccJ < pp and (hhJ - pp) <= 2.5 * atrS
+            array.push(sweepPx, pp)
+            array.push(sweepDir, "UP")
+            array.push(sweepBar, bar_index - j)
+            swept := true
+        else if llJ < pp and ccJ > pp and (pp - llJ) <= 2.5 * atrS
+            array.push(sweepPx, pp)
+            array.push(sweepDir, "DOWN")
+            array.push(sweepBar, bar_index - j)
+            swept := true
+        if swept
+            break
+    if swept
+        array.push(sweptSet, pp)
+
+// pool lines (recreated each bar; swept pools tinted)
+var array<line> poolLines = array.new_line()
+if showPools
+    for i = 0 to array.size(poolLines) - 1
+        line.delete(array.get(poolLines, i))
+    array.clear(poolLines)
+    for i = 0 to array.size(poolPx) - 1
+        pp = array.get(poolPx, i)
+        isSwept = false
+        for k = 0 to array.size(sweptSet) - 1
+            if math.abs(array.get(sweptSet, k) - pp) <= tol
+                isSwept := true
+                break
+        baseCol = array.get(poolSide, i) == "ABOVE" ? color.red : color.green
+        array.push(poolLines, line.new(bar_index, pp, bar_index, pp, extend = extend.right, color = isSwept ? color.new(baseCol, 10) : color.new(baseCol, 55), style = isSwept ? line.style_solid : line.style_dashed, width = isSwept ? 2 : 1))
+
+// latest swept pool within the last 6 bars with reclaim (mirrors entries A4).
+// Sweep at bar (bar_index - age) is confirmed by bar (bar_index - age + 1)
+// closing back beyond the pool — never reads future data.
+sweepSetupDir = 0
+sweepSetupPx = na
+bestSweepBar = -1
+for i = 0 to array.size(sweepPx) - 1
+    sb = array.get(sweepBar, i)
+    age = bar_index - sb
+    if age >= 1 and age <= 6 and sb > bestSweepBar
+        pp = array.get(sweepPx, i)
+        sd = array.get(sweepDir, i)
+        reclaimed = sd == "UP" ? close[age - 1] < pp : close[age - 1] > pp
+        if reclaimed
+            bestSweepBar := sb
+            sweepSetupDir := sd == "UP" ? -1 : 1
+            sweepSetupPx := pp
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13 · FVG + ORDER BLOCK ZONES (mirrors fvg.ts / order-block.ts quality math)
+// ─────────────────────────────────────────────────────────────────────────────
+var array<string> zKind = array.new_string()
+var array<int> zBar = array.new_int()
+var array<float> zLo = array.new_float()
+var array<float> zHi = array.new_float()
+var array<int> zDir = array.new_int()
+var array<float> zQ = array.new_float()
+var array<box> zBox = array.new_box()
+
+meanVol50 = ta.sma(volume, 50)
+meanVolS = nz(meanVol50, volume)
+
+// prune old / mitigated zones
+nzAll = array.size(zKind)
+if nzAll > 0
+    for k = 0 to nzAll - 1
+        idx = nzAll - 1 - k
+        age = bar_index - array.get(zBar, idx)
+        mitigated = false
+        if array.get(zDir, idx) == 1 and not na(close) and close < array.get(zLo, idx)
+            mitigated := true
+        if array.get(zDir, idx) == -1 and not na(close) and close > array.get(zHi, idx)
+            mitigated := true
+        if age > 40 or mitigated
+            box.delete(array.get(zBox, idx))
+            array.remove(zKind, idx)
+            array.remove(zBar, idx)
+            array.remove(zLo, idx)
+            array.remove(zHi, idx)
+            array.remove(zDir, idx)
+            array.remove(zQ, idx)
+            array.remove(zBox, idx)
+
+addZone(kind, b, lo, hi, dir, q) =>
+    array.push(zKind, kind)
+    array.push(zBar, b)
+    array.push(zLo, lo)
+    array.push(zHi, hi)
+    array.push(zDir, dir)
+    array.push(zQ, q)
+    col = dir == 1 ? color.new(color.green, 88) : color.new(color.red, 88)
+    bd = dir == 1 ? color.new(color.green, 20) : color.new(color.red, 20)
+    array.push(zBox, box.new(b, hi, b, lo, border_color = bd, bgcolor = col, extend = extend.right))
+
+// FVG — three-candle imbalance (fvg.ts): right.low - left.high >= minGap
+minGapF = math.max(0.25 * atrS, syminfo.mintick)
+if barstate.isconfirmed
+    if low > high[2] and (low - high[2]) >= minGapF
+        gapAtr = (low - high[2]) / atrS
+        sizeSc = clampF(gapAtr, 0, 1)
+        freshSc = 1.0
+        volSc = clampF(volume / math.max(meanVolS, 1e-9), 0, 1)
+        qFvg = math.round(100 * (0.3 * sizeSc + 0.25 * freshSc + 0.25 * volSc + 0.2 * 0.5))
+        if showFvg
+            addZone("FVG", bar_index, high[2], low, 1, qFvg)
+    else if high < low[2] and (low[2] - high) >= minGapF
+        gapAtr = (low[2] - high) / atrS
+        sizeSc = clampF(gapAtr, 0, 1)
+        freshSc = 1.0
+        volSc = clampF(volume / math.max(meanVolS, 1e-9), 0, 1)
+        qFvg = math.round(100 * (0.3 * sizeSc + 0.25 * freshSc + 0.25 * volSc + 0.2 * 0.5))
+        if showFvg
+            addZone("FVG", bar_index, high, low[2], -1, qFvg)
+    // Order block — last opposite-color candle before >= 1 ATR displacement over 3 bars
+    // (order-block.ts: bullDisp = maxHigh - c.low >= dispAtr * atr over next 3 bars)
+    dispAtrF = 1.0
+    bullDisp = (math.max(high[1], math.max(high[2], high[3])) - low[1]) >= dispAtrF * atrS
+    bearDisp = (high[1] - math.min(low[1], math.min(low[2], low[3]))) >= dispAtrF * atrS
+    obBar = -1
+    obDir = 0
+    if bullDisp and close[1] < open[1]
+        obBar := 1
+        obDir := 1
+    else if bearDisp and close[1] > open[1]
+        obBar := 1
+        obDir := -1
+    if obBar > 0
+        sizeScOb = clampF((high[obBar] - low[obBar]) / atrS * 1.5, 0, 1)
+        freshScOb = 1.0
+        volScOb = clampF(volume[obBar] / math.max(meanVolS, 1e-9), 0, 1)
+        qOb = math.round(100 * (0.3 * sizeScOb + 0.2 * freshScOb + 0.2 * volScOb + 0.15 * 0.5 + 0.15 * 0.5))
+        if showOb
+            addZone("OB", bar_index - obBar, low[obBar], high[obBar], obDir, qOb)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14 · HTF BIAS LADDER (mirrors bias.ts: HTF dominates; tradeable = two lowest
+//     ladder TFs agree). lookahead_off ⇒ confirmed, one-period-delayed HTF
+//     state — conservative, no repaint.
+// ─────────────────────────────────────────────────────────────────────────────
+[wSt, wSc, wDir, wAg, wAdx] = request.security(syminfo.tickerid, tfA, calcFullAnalysis(), lookahead = barmerge.lookahead_off)
+[dSt, dSc, dDir, dAg, dAdx] = request.security(syminfo.tickerid, tfB, calcFullAnalysis(), lookahead = barmerge.lookahead_off)
+[h4St, h4Sc, h4Dir, h4Ag, h4Adx] = request.security(syminfo.tickerid, tfC, calcFullAnalysis(), lookahead = barmerge.lookahead_off)
+[h1St, h1Sc, h1Dir, h1Ag, h1Adx] = request.security(syminfo.tickerid, tfD, calcFullAnalysis(), lookahead = barmerge.lookahead_off)
+
+calcBias(st, score, dir) =>
+    res = "NEUTRAL"
+    if st == 1 or st == -1
+        if score >= 40
+            res := st == 1 ? "BULL" : "BEAR"
+        else
+            res := "NEUTRAL"
+    else if st == 0
+        if score >= 60
+            res := dir == 1 ? "BULL" : dir == -1 ? "BEAR" : "RANGE"
+        else
+            res := "RANGE"
+    else
+        if score >= 60
+            res := dir == 1 ? "BULL" : dir == -1 ? "BEAR" : "NEUTRAL"
+        else
+            res := "NEUTRAL"
+    res
+
+chartState = stState == "UPTREND" ? 1 : stState == "DOWNTREND" ? -1 : stState == "RANGE" ? 0 : 2
+chartBias = calcBias(chartState, trendScore, trendDir)
+
+// intraday anchor adjust on the execution (chart) TF — mirrors bias.ts Rule 2.7/2.8
+if (chartBias == "RANGE" or chartBias == "NEUTRAL") and not na(myVwap)
+    aboveOpen = close >= dOpen
+    aboveVwap = close >= myVwap
+    if aboveOpen and aboveVwap
+        chartBias := "BULL"
+    else if not aboveOpen and not aboveVwap
+        chartBias := "BEAR"
+
+// tradeable bias = two lowest ladder TFs agree (t0 = next ladder TF above chart TF)
+chartSec = timeframe.in_seconds()
+t0Sec = 999999999
+t0Bias = "NEUTRAL"
+candSec = timeframe.in_seconds(tfA)
+if candSec > chartSec and candSec < t0Sec
+    t0Sec := candSec
+    t0Bias := calcBias(wSt, wSc, wDir)
+candSec := timeframe.in_seconds(tfB)
+if candSec > chartSec and candSec < t0Sec
+    t0Sec := candSec
+    t0Bias := calcBias(dSt, dSc, dDir)
+candSec := timeframe.in_seconds(tfC)
+if candSec > chartSec and candSec < t0Sec
+    t0Sec := candSec
+    t0Bias := calcBias(h4St, h4Sc, h4Dir)
+candSec := timeframe.in_seconds(tfD)
+if candSec > chartSec and candSec < t0Sec
+    t0Sec := candSec
+    t0Bias := calcBias(h1St, h1Sc, h1Dir)
+if t0Sec == 999999999
+    t0Bias := calcBias(wSt, wSc, wDir)
+
+tradeable = "NEUTRAL"
+if chartBias == t0Bias and (chartBias == "BULL" or chartBias == "BEAR" or chartBias == "RANGE")
+    tradeable := chartBias
+
+conflicts = 0
+if (chartBias == "BULL" and t0Bias == "BEAR") or (chartBias == "BEAR" and t0Bias == "BULL")
+    conflicts := 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15 · SESSION QUALITY (scoring #10 — NY prime, London tradable; UTC)
+// ─────────────────────────────────────────────────────────────────────────────
+nowMin = hour(time) * 60 + minute(time)
+dow = dayofweek(time)
+inPrime = dow >= 2 and dow <= 6 and nowMin >= 810 and nowMin < 1260
+inTradable = dow >= 2 and dow <= 6 and nowMin >= 480 and nowMin < 960
+sessionSc = inPrime ? 10 : inTradable ? 8 : 4
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16 · SETUP DETECTORS (mirrors entries.ts A1/A2/A3/A4/A5/C1/C2/D3/B3)
+//     Each returns [found, dir(1/-1), zoneLo, zoneHi, stopHint, type, invalidation]
+// ─────────────────────────────────────────────────────────────────────────────
+pullbackSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "PULLBACK"
+    inv = 0.0
+    if trendScore >= 50 and trendDir != 0 and not na(sh1) and not na(sl1)
+        if trendDir == 1
+            if not na(sh1Bar) and not na(sl1Bar) and not na(sl2) and sh1Bar > sl1Bar
+                leg = sh1 - sl2
+                if leg > 0.5 * atrS
+                    r38 = sh1 - 0.382 * leg
+                    r62 = sh1 - 0.618 * leg
+                    if close <= r38 + 0.15 * leg and close >= r62 - 0.15 * leg
+                        stopH = sl1 - 0.25 * atrS
+                        if stopH < close
+                            f := true
+                            d := 1
+                            zLo := r62
+                            zHi := r38
+                            inv := sl1
+        else
+            if not na(sh1Bar) and not na(sl1Bar) and not na(sh2) and sl1Bar > sh1Bar
+                leg = sh2 - sl1
+                if leg > 0.5 * atrS
+                    r38 = sl1 + 0.382 * leg
+                    r62 = sl1 + 0.618 * leg
+                    if close >= r38 - 0.15 * leg and close <= r62 + 0.15 * leg
+                        stopH = sh1 + 0.25 * atrS
+                        if stopH > close
+                            f := true
+                            d := -1
+                            zLo := r38
+                            zHi := r62
+                            inv := sh1
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+breakoutSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "BREAKOUT"
+    inv = 0.0
+    comp = atrRank < 20
+    volX = volume / math.max(meanVolS, 1e-9)
+    disp = math.max(high - low, math.abs(close - close[1])) >= 0.5 * atrS
+    if comp and volX >= 2.0 and disp and barstate.isconfirmed
+        upC = close > open
+        if upC and trendDir != -1
+            f := true
+            d := 1
+            zLo := math.max(high[1], open)
+            zHi := high
+            stopH := high - atrS
+            inv := high[1]
+        else if not upC and trendDir != 1
+            f := true
+            d := -1
+            zLo := low
+            zHi := math.min(low[1], open)
+            stopH := low + atrS
+            inv := low[1]
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+retestSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "RETEST"
+    inv = 0.0
+    bestDist = 0.75 * atrS
+    bestI = -1
+    for i = 0 to array.size(revPx) - 1
+        dd = math.abs(array.get(revPx, i) - close)
+        if dd <= bestDist
+            bestDist := dd
+            bestI := i
+    if bestI >= 0
+        lv = array.get(revPx, bestI)
+        isSupport = array.get(revTy, bestI) == "S"
+        if isSupport
+            if low <= lv + 0.2 * atrS and close > lv
+                f := true
+                d := 1
+                zLo := lv - 0.1 * atrS
+                zHi := lv + 0.3 * atrS
+                stopH := lv - 0.5 * atrS
+                inv := lv
+        else
+            if high >= lv - 0.2 * atrS and close < lv
+                f := true
+                d := -1
+                zLo := lv - 0.3 * atrS
+                zHi := lv + 0.1 * atrS
+                stopH := lv + 0.5 * atrS
+                inv := lv
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+sweepSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "LIQUIDITY_SWEEP"
+    inv = 0.0
+    if sweepSetupDir != 0 and not na(sweepSetupPx)
+        f := true
+        d := sweepSetupDir
+        if d == 1
+            zLo := math.min(close, sweepSetupPx + 0.1 * atrS)
+            zHi := close + 0.2 * atrS
+            stopH := sweepSetupPx - atrS
+            inv := sweepSetupPx
+        else
+            zLo := close - 0.2 * atrS
+            zHi := math.max(close, sweepSetupPx - 0.1 * atrS)
+            stopH := sweepSetupPx + atrS
+            inv := sweepSetupPx
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+momentumSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "MOMENTUM_IGNITION"
+    inv = 0.0
+    deltaC = close >= open ? volume : -volume
+    sumD = 0.0
+    cntD = 0.0
+    for i = 0 to 19
+        if not na(volume[i])
+            sumD += math.abs(close[i] >= open[i] ? volume[i] : -volume[i])
+            cntD += 1.0
+    meanD = cntD > 0 ? sumD / cntD : 0.0
+    ratio = meanD > 0 ? math.abs(deltaC) / meanD : 0.0
+    if ratio >= 2.5 and (high - low) >= atrS
+        if deltaC > 0
+            f := true
+            d := 1
+            zLo := open
+            zHi := high
+            stopH := low - 0.25 * atrS
+            inv := open
+        else
+            f := true
+            d := -1
+            zLo := low
+            zHi := open
+            stopH := high + 0.25 * atrS
+            inv := open
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+obSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "ORDER_BLOCK"
+    inv = 0.0
+    bestQ = 0.0
+    bestI = -1
+    for i = 0 to array.size(zKind) - 1
+        if array.get(zKind, i) == "OB" and array.get(zQ, i) >= 60 and array.get(zQ, i) > bestQ
+            bestQ := array.get(zQ, i)
+            bestI := i
+    if bestI >= 0
+        zl = array.get(zLo, bestI)
+        zh = array.get(zHi, bestI)
+        zd = array.get(zDir, bestI)
+        if close >= zl - 0.1 * atrS and close <= zh + 0.1 * atrS
+            reaction = zd == 1 ? close > open : close < open
+            volOk = volume >= 1.5 * meanVolS
+            if reaction and volOk
+                f := true
+                d := zd
+                zLo := zl
+                zHi := zh
+                stopH := zd == 1 ? zl - atrS : zh + atrS
+                inv := zd == 1 ? zl : zh
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+fvgSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "FVG"
+    inv = 0.0
+    bestQ = 0.0
+    bestI = -1
+    for i = 0 to array.size(zKind) - 1
+        if array.get(zKind, i) == "FVG" and array.get(zQ, i) >= 55 and math.abs(array.get(zLo, i) - close) <= 0.4 * atrS and array.get(zQ, i) > bestQ
+            bestQ := array.get(zQ, i)
+            bestI := i
+    if bestI >= 0
+        zl = array.get(zLo, bestI)
+        zh = array.get(zHi, bestI)
+        zd = array.get(zDir, bestI)
+        reaction = zd == 1 ? close > open : close < open
+        if reaction
+            f := true
+            d := zd
+            zLo := zl
+            zHi := zh
+            stopH := zd == 1 ? zl - 0.25 * atrS : zh + 0.25 * atrS
+            inv := zd == 1 ? zl : zh
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+springSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "SPRING"
+    inv = 0.0
+    rangeLo = ta.lowest(low, 20)
+    rangeHi = ta.highest(high, 20)
+    if not na(rangeLo) and not na(rangeHi) and (rangeHi - rangeLo) >= atrS and (rangeHi - rangeLo) <= 3 * atrS
+        spring = false
+        for i = 0 to 2
+            if low[i] < rangeLo[1] and close[i] > rangeLo[1]
+                spring := true
+        if spring and volume >= 1.2 * meanVolS
+            f := true
+            d := 1
+            zLo := math.min(close, rangeLo + 0.2 * atrS)
+            zHi := close + 0.15 * atrS
+            stopH := rangeLo - 0.25 * atrS
+            inv := rangeLo
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+vwapRejSetup() =>
+    f = false
+    d = 0
+    zLo = 0.0
+    zHi = 0.0
+    stopH = 0.0
+    typ = "VWAP_REJECTION"
+    inv = 0.0
+    if not na(myVwap) and not na(vwapSig)
+        if math.abs(vwapSlope) <= 0.1 and math.abs(vwapDev) <= 0.4
+            if not (trendScore >= 60 and trendDir != 0)
+                if close < myVwap and low <= myVwap and close > myVwap
+                    f := true
+                    d := 1
+                    zLo := myVwap - 0.1 * atrS
+                    zHi := close + 0.1 * atrS
+                    stopH := myVwap - vwapSig
+                    inv := myVwap + vwapSig
+                else if close > myVwap and high >= myVwap and close < myVwap
+                    f := true
+                    d := -1
+                    zLo := close - 0.1 * atrS
+                    zHi := myVwap + 0.1 * atrS
+                    stopH := myVwap + vwapSig
+                    inv := myVwap - vwapSig
+    [f, d, zLo, zHi, stopH, typ, inv]
+
+// run detectors in the platform's priority order (entries.ts DETECTORS order)
+[pbF, pbD, pbLo, pbHi, pbStop, pbTy, pbInv] = pullbackSetup()
+[boF, boD, boLo, boHi, boStop, boTy, boInv] = breakoutSetup()
+[reF, reD, reLo, reHi, reStop, reTy, reInv] = retestSetup()
+[swF, swD, swLo, swHi, swStop, swTy, swInv] = sweepSetup()
+[moF, moD, moLo, moHi, moStop, moTy, moInv] = momentumSetup()
+[obF, obD, obLo, obHi, obStop, obTy, obInv] = obSetup()
+[fgF, fgD, fgLo, fgHi, fgStop, fgTy, fgInv] = fvgSetup()
+[spF, spD, spLo, spHi, spStop, spTy, spInv] = springSetup()
+[vwF, vwD, vwLo, vwHi, vwStop, vwTy, vwInv] = vwapRejSetup()
+
+// bias gate: setups must not fight the tradeable bias (entries.ts biasAllows)
+biasAllows(dir) =>
+    tradeable == "NEUTRAL" or tradeable == "RANGE" or (tradeable == "BULL" and dir == 1) or (tradeable == "BEAR" and dir == -1)
+
+setF = false
+setDir = 0
+setLo = 0.0
+setHi = 0.0
+setStop = 0.0
+setType = ""
+setInv = 0.0
+if pbF and biasAllows(pbD)
+    setF := true
+    setDir := pbD
+    setLo := pbLo
+    setHi := pbHi
+    setStop := pbStop
+    setType := pbTy
+    setInv := pbInv
+else if boF and biasAllows(boD)
+    setF := true
+    setDir := boD
+    setLo := boLo
+    setHi := boHi
+    setStop := boStop
+    setType := boTy
+    setInv := boInv
+else if reF and biasAllows(reD)
+    setF := true
+    setDir := reD
+    setLo := reLo
+    setHi := reHi
+    setStop := reStop
+    setType := reTy
+    setInv := reInv
+else if swF and biasAllows(swD)
+    setF := true
+    setDir := swD
+    setLo := swLo
+    setHi := swHi
+    setStop := swStop
+    setType := swTy
+    setInv := swInv
+else if moF and biasAllows(moD)
+    setF := true
+    setDir := moD
+    setLo := moLo
+    setHi := moHi
+    setStop := moStop
+    setType := moTy
+    setInv := moInv
+else if obF and biasAllows(obD)
+    setF := true
+    setDir := obD
+    setLo := obLo
+    setHi := obHi
+    setStop := obStop
+    setType := obTy
+    setInv := obInv
+else if fgF and biasAllows(fgD)
+    setF := true
+    setDir := fgD
+    setLo := fgLo
+    setHi := fgHi
+    setStop := fgStop
+    setType := fgTy
+    setInv := fgInv
+else if spF and biasAllows(spD)
+    setF := true
+    setDir := spD
+    setLo := spLo
+    setHi := spHi
+    setStop := spStop
+    setType := spTy
+    setInv := spInv
+else if vwF and biasAllows(vwD)
+    setF := true
+    setDir := vwD
+    setLo := vwLo
+    setHi := vwHi
+    setStop := vwStop
+    setType := vwTy
+    setInv := vwInv
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17 · STOP + TARGETS (mirrors stop-engine.ts / take-profit.ts)
+// ─────────────────────────────────────────────────────────────────────────────
+entryPx = close
+stopPx = na
+stopDist = 0.0
+if setF
+    rawStop = setStop
+    // offset obvious resting points: round numbers & tight stops (stop-engine.ts)
+    if setDir == 1
+        if math.abs(rawStop / math.max(syminfo.mintick * 20, syminfo.mintick) - math.round(rawStop / math.max(syminfo.mintick * 20, syminfo.mintick))) < 1e-9
+            rawStop := rawStop - 0.25 * atrS
+        if close - rawStop < 0.5 * atrS
+            rawStop := rawStop - 0.25 * atrS
+    else
+        if math.abs(rawStop / math.max(syminfo.mintick * 20, syminfo.mintick) - math.round(rawStop / math.max(syminfo.mintick * 20, syminfo.mintick))) < 1e-9
+            rawStop := rawStop + 0.25 * atrS
+        if rawStop - close < 0.5 * atrS
+            rawStop := rawStop + 0.25 * atrS
+    stopPx := rawStop
+    stopDist := math.abs(entryPx - stopPx) / atrS
+    // regime-bounded validity: 0.5–3.0 ATR (stop-engine.ts)
+    if stopDist < 0.5 or stopDist > 3.0
+        setF := false
+
+t1 = na
+t2 = na
+t3 = na
+rrVal = 0.0
+if setF
+    srcPx = array.new_float()
+    srcW = array.new_float()
+    // opposing liquidity (nearest pool in trade direction)
+    bestPool = na
+    bestPoolD = 1e18
+    for i = 0 to array.size(poolPx) - 1
+        pp = array.get(poolPx, i)
+        ok = setDir == 1 ? pp > entryPx and array.get(poolSide, i) == "ABOVE" : pp < entryPx and array.get(poolSide, i) == "BELOW"
+        if ok
+            dd = math.abs(pp - entryPx)
+            if dd < bestPoolD
+                bestPoolD := dd
+                bestPool := pp
+    if not na(bestPool)
+        array.push(srcPx, bestPool)
+        array.push(srcW, 0.8)
+    // opposing swing
+    bestOpp = na
+    bestOppD = 1e18
+    for i = 0 to array.size(swPx) - 1
+        spx = array.get(swPx, i)
+        ok = setDir == 1 ? spx > entryPx and array.get(swTy, i) == "H" : spx < entryPx and array.get(swTy, i) == "L"
+        if ok
+            dd = math.abs(spx - entryPx)
+            if dd < bestOppD
+                bestOppD := dd
+                bestOpp := spx
+    if not na(bestOpp)
+        array.push(srcPx, bestOpp)
+        array.push(srcW, 0.6)
+    // value area edge
+    if setDir == 1 and not na(vaHighP) and vaHighP > entryPx
+        array.push(srcPx, vaHighP)
+        array.push(srcW, 0.5)
+    if setDir == -1 and not na(vaLowP) and vaLowP < entryPx
+        array.push(srcPx, vaLowP)
+        array.push(srcW, 0.5)
+    // measured move (leg = |lastHigh - lastLow|, factors 1.0 / 1.272 / 1.618)
+    lastH = na
+    lastL = na
+    for i = 0 to array.size(swPx) - 1
+        if array.get(swTy, i) == "H"
+            lastH := array.get(swPx, i)
+        if array.get(swTy, i) == "L"
+            lastL := array.get(swPx, i)
+    if not na(lastH) and not na(lastL)
+        leg = math.abs(lastH - lastL)
+        if leg > 0
+            array.push(srcPx, setDir == 1 ? lastL + leg * 1.0 : lastH - leg * 1.0)
+            array.push(srcW, 0.4)
+            array.push(srcPx, setDir == 1 ? lastL + leg * 1.272 : lastH - leg * 1.272)
+            array.push(srcW, 0.4)
+            array.push(srcPx, setDir == 1 ? lastL + leg * 1.618 : lastH - leg * 1.618)
+            array.push(srcW, 0.4)
+    // cluster sources within 0.5 ATR, weight-additive (take-profit.ts)
+    cPx = array.new_float()
+    cW = array.new_float()
+    for i = 0 to array.size(srcPx) - 1
+        px = array.get(srcPx, i)
+        w = array.get(srcW, i)
+        found = -1
+        for j = 0 to array.size(cPx) - 1
+            if math.abs(array.get(cPx, j) - px) <= 0.5 * atrS
+                found := j
+                break
+        if found >= 0
+            array.set(cW, found, array.get(cW, found) + w)
+            array.set(cPx, found, (array.get(cPx, found) + px) / 2.0)
+        else
+            array.push(cPx, px)
+            array.push(cW, w)
+    // primary = highest-weight cluster; R:R vs stop
+    bestW = -1.0
+    bestP = na
+    for i = 0 to array.size(cPx) - 1
+        if array.get(cW, i) > bestW
+            bestW := array.get(cW, i)
+            bestP := array.get(cPx, i)
+    if not na(bestP) and not na(stopPx)
+        risk = math.abs(entryPx - stopPx)
+        if risk > 0
+            rrVal := (setDir == 1 ? bestP - entryPx : entryPx - bestP) / risk
+            // R-multiple ladder (config takeProfit.scaleLadder: 1.5R/40%, 2.5R/40%, 3R/20%)
+            t1 := entryPx + setDir * 1.5 * risk
+            t2 := entryPx + setDir * 2.5 * risk
+            t3 := entryPx + setDir * 3.0 * risk
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18 · TRADE SCORING (mirrors scoring.ts — 10 confluence sensors, 0–100)
+// ─────────────────────────────────────────────────────────────────────────────
+scoreTotal = 0.0
+scoreBand = "NO_SETUP"
+scoreReason = ""
+volRatio3 = 0.0
+delta3 = 0.0
+if setF and not na(stopPx) and not na(t1) and rrVal > 0
+    // 1 — trend alignment
+    scTrend = trendScore >= 70 ? 10.0 : trendScore >= 50 ? 7.0 : trendScore >= 35 ? 4.0 : 1.0
+    if trendDir != setDir
+        scTrend := math.max(0, scTrend - 4)
+    // 2 — structure quality (stop distance in ATR)
+    scStruct = 5.0
+    if stopDist >= 0.75 and stopDist <= 2.0
+        scStruct := 10.0
+    else if stopDist < 0.5 or stopDist > 3.0
+        scStruct := 3.0
+    else if stopDist < 0.75
+        scStruct := 6.0
+    else
+        scStruct := 7.0
+    // 3 — liquidity quality
+    scLiq = 4.0
+    if setType == "LIQUIDITY_SWEEP"
+        scLiq := 9.0
+    else if array.size(poolPx) > 0
+        scLiq := 6.0
+    // 4 — volume confirmation (3-bar window vs 50-bar mean)
+    v3 = 0.0
+    for i = 0 to 2
+        v3 += volume[i]
+    volRatio3 := (v3 / 3.0) / math.max(meanVolS, 1e-9)
+    scVol = volRatio3 >= 2.5 ? 10.0 : volRatio3 >= 1.5 ? 7.0 : volRatio3 >= 1.0 ? 4.0 : 1.0
+    // 5 — delta (3-bar sum, signed-volume proxy)
+    delta3 := (close >= open ? volume : -volume) + (close[1] >= open[1] ? volume[1] : -volume[1]) + (close[2] >= open[2] ? volume[2] : -volume[2])
+    v3sum = volume + volume[1] + volume[2]
+    scDelta = 5.0
+    if (setDir == 1 and delta3 > 0) or (setDir == -1 and delta3 < 0)
+        scDelta := 9.0
+    else if math.abs(delta3) > 0.3 * math.max(v3sum, 1)
+        scDelta := 0.0
+    else
+        scDelta := 4.0
+    // 6 — VWAP alignment
+    scVwap = 5.0
+    if not na(myVwap)
+        if setType == "VWAP_REJECTION"
+            scVwap := math.abs(vwapDev) < 0.4 ? 10.0 : 5.0
+        else
+            vwapOk = setDir == 1 ? vwapDev > 0 : vwapDev < 0
+            scVwap := vwapOk ? 8.0 : math.abs(vwapDev) < 0.3 ? 5.0 : 2.0
+    // 7 — volume profile alignment
+    scVP = 3.0
+    if not na(pocPrice) and not na(vaHighP) and not na(vaLowP)
+        atVaEdge = setDir == 1 ? close <= vaLowP + 0.3 * atrS : close >= vaHighP - 0.3 * atrS
+        atPoc = math.abs(close - pocPrice) <= 0.3 * atrS
+        inLvn = false
+        for i = 0 to array.size(lvnPx) - 1
+            if array.get(lvnPx, i) >= setLo and array.get(lvnPx, i) <= setHi
+                inLvn := true
+        if inLvn
+            scVP := 0.0
+        else if atVaEdge
+            scVP := 9.0
+        else if atPoc
+            scVP := 7.0
+        else if close >= vaLowP and close <= vaHighP
+            scVP := 4.0
+    // 8 — market regime
+    scRegime = 5.0
+    if regime == "TRENDING_UP" or regime == "TRENDING_DOWN"
+        scRegime := 10.0
+    else if regime == "HIGH_VOL_BREAKOUT" and setType == "BREAKOUT"
+        scRegime := 7.0
+    else if regime == "CRISIS"
+        scRegime := 0.0
+    // 9 — risk/reward
+    isRangeSetup = setType == "VWAP_REJECTION"
+    minRRv = isRangeSetup ? minRRRev : minRR
+    scRR = rrVal >= 3.0 ? 10.0 : rrVal >= 2.0 ? 8.0 : rrVal >= minRRv ? 5.0 : 0.0
+    // 10 — session quality
+    scSess = sessionSc
+    // total
+    wSum = sTrend + sStruct + sLiq + sVol + sDelta + sVwap + sVP + sRegime + sRR + sSession
+    scoreTotal := math.round(10 * (scTrend * sTrend + scStruct * sStruct + scLiq * sLiq + scVol * sVol + scDelta * sDelta + scVwap * sVwap + scVP * sVP + scRegime * sRegime + scRR * sRR + scSess * sSession) / wSum)
+    // band + auto-rejects (mirrors filters F3/F4 + scoring R9)
+    if rrVal < minRRv
+        scoreTotal := 0
+        scoreBand := "REJECT"
+        scoreReason := "R:R " + str.tostring(rrVal, "#.##") + " < " + str.tostring(minRRv, "#.##")
+    else if atrRank < 5
+        scoreTotal := 0
+        scoreBand := "REJECT"
+        scoreReason := "F3 dead market (ATR pct < 5)"
+    else if atrRank > 97
+        scoreTotal := 0
+        scoreBand := "REJECT"
+        scoreReason := "F4 crisis volatility (ATR pct > 97)"
+    else if scoreTotal >= idealSc
+        scoreBand := "EXECUTE_FULL"
+    else if scoreTotal >= minExec
+        scoreBand := "EXECUTE_REDUCED"
+    else if scoreTotal >= autoRej
+        scoreBand := "DEFER"
+    else
+        scoreBand := "REJECT"
+        scoreReason := "score " + str.tostring(int(scoreTotal)) + " < auto-reject " + str.tostring(autoRej)
+
+// setup drawings (entry zone box, stop, R-multiple targets)
+var box setupBox = na
+var line stopLine = na
+var array<line> tgtLines = array.new_line()
+var int lastSetupBar = -999999
+if showSetups
+    if setF and bar_index != lastSetupBar
+        lastSetupBar := bar_index
+        if not na(setupBox)
+            box.delete(setupBox)
+        if not na(stopLine)
+            line.delete(stopLine)
+        for i = 0 to array.size(tgtLines) - 1
+            line.delete(array.get(tgtLines, i))
+        array.clear(tgtLines)
+        boxCol = setDir == 1 ? color.new(color.green, 85) : color.new(color.red, 85)
+        setupBox := box.new(bar_index, setHi, bar_index, setLo, border_color = boxCol, bgcolor = boxCol, extend = extend.right)
+        if not na(stopPx)
+            stopLine := line.new(bar_index, stopPx, bar_index, stopPx, extend = extend.right, color = color.red, style = line.style_solid, width = 2)
+        if not na(t1)
+            array.push(tgtLines, line.new(bar_index, t1, bar_index, t1, extend = extend.right, color = color.new(color.green, 0), style = line.style_dashed, width = 1))
+        if not na(t2)
+            array.push(tgtLines, line.new(bar_index, t2, bar_index, t2, extend = extend.right, color = color.new(color.green, 25), style = line.style_dashed, width = 1))
+        if not na(t3)
+            array.push(tgtLines, line.new(bar_index, t3, bar_index, t3, extend = extend.right, color = color.new(color.green, 50), style = line.style_dashed, width = 1))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19 · STRATEGY EXECUTION (fixed-fractional sizing, next-bar fills, risk gates)
+// ─────────────────────────────────────────────────────────────────────────────
+var int lastExitBar = -999999
+var int consecLosses = 0
+var int dayTrades = 0
+var int lastDay = -1
+var bool inPos = false
+var string posEntryId = ""
+var float posStop = na
+var float posInv = na
+var float posT1 = na
+var float posT2 = na
+var float posT3 = na
+
+curDay = time("D")
+if curDay != lastDay
+    dayTrades := 0
+    lastDay := curDay
+
+// lockout + loss counters update when a position closes
+if strategy.position_size != 0 and not inPos
+    inPos := true
+if strategy.position_size == 0 and inPos
+    inPos := false
+    lastExitBar := bar_index
+    lastTradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if na(lastTradeProfit)
+        lastTradeProfit := 0.0
+    if lastTradeProfit < 0
+        consecLosses += 1
+    else
+        consecLosses := 0
+
+// invalidation exit (mirrors backtester: close beyond the setup's invalidation)
+if strategy.position_size != 0 and not na(posInv)
+    if posEntryId == "ITE_LONG" and close < posInv
+        strategy.close("ITE_LONG", comment = "invalidated")
+    else if posEntryId == "ITE_SHORT" and close > posInv
+        strategy.close("ITE_SHORT", comment = "invalidated")
+
+canEnter = enStrat and setF and (scoreBand == "EXECUTE_FULL" or scoreBand == "EXECUTE_REDUCED") and strategy.position_size == 0 and bar_index > lastExitBar + deferB and dayTrades < maxDayT and consecLosses < cbLoss and not na(stopPx) and not na(t1)
+if canEnter
+    riskAmt = strategy.equity * riskPct / 100.0
+    stopDistPx = math.abs(close - stopPx)
+    if stopDistPx > 0
+        qtyUnits = math.max(riskAmt / stopDistPx, 1)
+        if setDir == 1
+            strategy.entry("ITE_LONG", strategy.long, qtyUnits, comment = setType + " " + scoreBand)
+            posEntryId := "ITE_LONG"
+        else
+            strategy.entry("ITE_SHORT", strategy.short, qtyUnits, comment = setType + " " + scoreBand)
+            posEntryId := "ITE_SHORT"
+        posStop := stopPx
+        posInv := setInv
+        posT1 := t1
+        posT2 := t2
+        posT3 := t3
+        dayTrades += 1
+
+// scaled exits — R-multiple ladder 1.5/2.5/3.0 (40/40/20 %), stop on the last leg
+if strategy.position_size != 0 and not na(posStop) and not na(posT1) and not na(posT2) and not na(posT3)
+    if posEntryId == "ITE_LONG"
+        strategy.exit("ITE_TP1", from_entry = "ITE_LONG", qty_percent = 40, limit = posT1)
+        strategy.exit("ITE_TP2", from_entry = "ITE_LONG", qty_percent = 40, limit = posT2)
+        strategy.exit("ITE_TP3", from_entry = "ITE_LONG", qty_percent = 20, limit = posT3, stop = posStop)
+    else if posEntryId == "ITE_SHORT"
+        strategy.exit("ITE_TP1", from_entry = "ITE_SHORT", qty_percent = 40, limit = posT1)
+        strategy.exit("ITE_TP2", from_entry = "ITE_SHORT", qty_percent = 40, limit = posT2)
+        strategy.exit("ITE_TP3", from_entry = "ITE_SHORT", qty_percent = 20, limit = posT3, stop = posStop)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20 · PLOTS
+// ─────────────────────────────────────────────────────────────────────────────
+plot(ta.ema(close, emaF), "EMA " + str.tostring(emaF), color.new(color.yellow, 20), 1)
+plot(ta.ema(close, emaM), "EMA " + str.tostring(emaM), color.new(color.orange, 20), 2)
+plot(ta.ema(close, emaS), "EMA " + str.tostring(emaS), color.new(color.fuchsia, 25), 2)
+plot(showVwapD and not na(myVwap) ? myVwap : na, "VWAP", color.new(color.orange, 0), 2)
+plot(showVwapD and vwapDevN >= 1 and not na(myVwap) and not na(vwapSig) ? myVwap + vwapSig : na, "+1σ", color.new(color.orange, 60), 1, plot.style_circles)
+plot(showVwapD and vwapDevN >= 1 and not na(myVwap) and not na(vwapSig) ? myVwap - vwapSig : na, "-1σ", color.new(color.orange, 60), 1, plot.style_circles)
+plot(showVwapD and vwapDevN >= 2 and not na(myVwap) and not na(vwapSig) ? myVwap + 2 * vwapSig : na, "+2σ", color.new(color.orange, 75), 1, plot.style_circles)
+plot(showVwapD and vwapDevN >= 2 and not na(myVwap) and not na(vwapSig) ? myVwap - 2 * vwapSig : na, "-2σ", color.new(color.orange, 75), 1, plot.style_circles)
+
+plotshape(bosUpMark, "BOS UP", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.small, text = "BOS")
+plotshape(bosDownMark, "BOS DOWN", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small, text = "BOS")
+plotshape(chochUpMark, "CHoCH UP", shape.triangleup, location.belowbar, color.new(color.aqua, 0), size = size.small, text = "CHoCH")
+plotshape(chochDownMark, "CHoCH DOWN", shape.triangledown, location.abovebar, color.new(color.orange, 0), size = size.small, text = "CHoCH")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21 · INFO TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+var table infoTbl = table.new(position.top_right, 2, 16, border_width = 1, border_color = color.new(color.gray, 70), bgcolor = color.new(color.black, 15))
+if barstate.islast and showTable
+    bandCol = scoreBand == "EXECUTE_FULL" ? color.new(color.green, 20) : scoreBand == "EXECUTE_REDUCED" ? color.new(color.teal, 20) : scoreBand == "DEFER" ? color.new(color.orange, 20) : color.new(color.red, 20)
+    table.cell(infoTbl, 0, 0, "Structure", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 0, stState, text_color = stState == "UPTREND" ? color.green : stState == "DOWNTREND" ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 1, "Trend", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 1, str.tostring(int(trendScore + 0.5)) + (trendDir == 1 ? " ▲" : trendDir == -1 ? " ▼" : " —") + " · agree " + str.tostring(trendAgree, "#.##"), text_color = trendDir == 1 ? color.green : trendDir == -1 ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 2, "ADX", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 2, str.tostring(adxNow, "#.#"), text_size = size.small)
+    table.cell(infoTbl, 0, 3, "Regime", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 3, regime, text_color = regime == "TRENDING_UP" or regime == "TRENDING_DOWN" ? color.green : regime == "CRISIS" ? color.red : color.white, text_size = size.small)
+    table.cell(infoTbl, 0, 4, "ATR pct", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 4, str.tostring(int(atrRank + 0.5)), text_size = size.small)
+    table.cell(infoTbl, 0, 5, "Bias " + tfA, text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 5, calcBias(wSt, wSc, wDir) + " " + str.tostring(int(wSc + 0.5)), text_color = calcBias(wSt, wSc, wDir) == "BULL" ? color.green : calcBias(wSt, wSc, wDir) == "BEAR" ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 6, "Bias " + tfB, text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 6, calcBias(dSt, dSc, dDir) + " " + str.tostring(int(dSc + 0.5)), text_color = calcBias(dSt, dSc, dDir) == "BULL" ? color.green : calcBias(dSt, dSc, dDir) == "BEAR" ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 7, "Bias " + tfC, text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 7, calcBias(h4St, h4Sc, h4Dir) + " " + str.tostring(int(h4Sc + 0.5)), text_color = calcBias(h4St, h4Sc, h4Dir) == "BULL" ? color.green : calcBias(h4St, h4Sc, h4Dir) == "BEAR" ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 8, "Bias " + tfD, text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 8, calcBias(h1St, h1Sc, h1Dir) + " " + str.tostring(int(h1Sc + 0.5)), text_color = calcBias(h1St, h1Sc, h1Dir) == "BULL" ? color.green : calcBias(h1St, h1Sc, h1Dir) == "BEAR" ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 9, "Bias " + timeframe.period, text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 9, chartBias + " " + str.tostring(int(trendScore + 0.5)), text_color = chartBias == "BULL" ? color.green : chartBias == "BEAR" ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 10, "Tradeable bias", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 10, tradeable + (conflicts == 1 ? " ⚠conflict" : ""), text_color = tradeable == "BULL" ? color.green : tradeable == "BEAR" ? color.red : color.gray, text_size = size.small)
+    table.cell(infoTbl, 0, 11, "VWAP dev", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 11, str.tostring(vwapDev, "#.##") + "σ", text_size = size.small)
+    table.cell(infoTbl, 0, 12, "POC / VA", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 12, not na(pocPrice) ? str.tostring(pocPrice, format.mintick) + " [" + (not na(vaLowP) ? str.tostring(vaLowP, format.mintick) : "?") + ", " + (not na(vaHighP) ? str.tostring(vaHighP, format.mintick) : "?") + "]" : "n/a", text_size = size.small)
+    table.cell(infoTbl, 0, 13, "Setup", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 13, setF ? setType + (setDir == 1 ? " LONG" : " SHORT") : "—", text_size = size.small)
+    table.cell(infoTbl, 0, 14, "Score", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 14, setF ? str.tostring(int(scoreTotal)) : "—", text_color = setF ? color.white : color.gray, bgcolor = setF ? bandCol : na, text_size = size.small)
+    table.cell(infoTbl, 0, 15, "Band", text_color = color.gray, text_size = size.small)
+    table.cell(infoTbl, 1, 15, setF ? scoreBand + (scoreReason != "" ? " · " + scoreReason : "") : "NO_SETUP", text_color = setF ? color.white : color.gray, bgcolor = setF ? bandCol : na, text_size = size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22 · ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(bosUpMark, "BOS UP", "Bullish break of structure")
+alertcondition(bosDownMark, "BOS DOWN", "Bearish break of structure")
+alertcondition(chochUpMark, "CHoCH UP", "Bearish structure shift (CHoCH up)")
+alertcondition(chochDownMark, "CHoCH DOWN", "Bearish structure shift (CHoCH down)")
+alertcondition(setF and scoreBand == "EXECUTE_FULL", "EXECUTE_FULL", "A++ setup score ≥ ideal")
+alertcondition(setF and (scoreBand == "EXECUTE_FULL" or scoreBand == "EXECUTE_REDUCED"), "EXECUTE", "Setup passes execution threshold")
