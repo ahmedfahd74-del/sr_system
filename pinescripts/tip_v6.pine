@@ -1,0 +1,421 @@
+// PINE SCRIPT v6 — Trading Intelligence Platform (research mirror)
+// ============================================================================
+// Mirrors the deterministic research engines built in the Python platform
+// (see ../../projects/trading-intelligence-platform/):
+//   • Fractal swing detection      — k-bar confirmation lag  (no look-ahead)
+//   • Structure classification     — HH/HL/LH/LL, BOS, CHoCH
+//   • Trend engine                 — 6 independent votes (no fused score)
+//   • Regime engine                — deterministic, precedence: COMPRESSION →
+//                                    HIGH_VOL/LOW_VOL → TRENDING_* → RANGE
+//   • Objective levels             — PDH/PDL/PWH/PWL/PMH/PML, opens, session
+//                                    hi/lo, prev NY-session hi/lo, VWAP, POC
+//
+// Visual rules:
+//   - Everything shown is causal. No repaint past bar confirmation.
+//   - Higher-TF security calls use lookahead=barmerge.lookahead_off.
+//   - Pine's ta.pivothigh/low inherently confirm k bars late: matches Python.
+// Author:  TIP Phase-0 mirror
+// Version: 6.0
+// ============================================================================
+
+//@version=6
+indicator("TIP — Market Structure + Trend + Regime + Levels [v6]",
+          shorttitle="TIP v6",
+          overlay=true,
+          max_lines_count=500,
+          max_boxes_count=100,
+          max_labels_count=500,
+          max_bars_back=2000)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+grp_swing   = "Swing Detection"
+grp_struct  = "Market Structure"
+grp_trend   = "Trend Engine"
+grp_regime  = "Regime Engine"
+grp_levels  = "Objective Levels"
+grp_display = "Display"
+
+swing_k      = input.int(3, "Swing k (confirmation bars)", minval=1, maxval=10, group=grp_swing)
+show_swings  = input.bool(true, "Show swing points", group=grp_swing)
+show_events  = input.bool(true, "Show structure events (HH/HL/BOS/CHoCH)", group=grp_struct)
+
+show_trend_panel = input.bool(true,  "Show trend panel", group=grp_trend)
+ema_fast         = input.int(20, "EMA fast", minval=2, group=grp_trend)
+ema_slow         = input.int(50, "EMA slow", minval=5, group=grp_trend)
+mom_lookback     = input.int(10, "Momentum lookback", minval=2, group=grp_trend)
+vol_ma           = input.int(20, "Volume MA", minval=2, group=grp_trend)
+
+show_regime_panel  = input.bool(true,  "Show regime panel", group=grp_regime)
+adx_period         = input.int(14, "ADX/ATR period", minval=2, group=grp_regime)
+adx_trend_thresh   = input.float(25.0, "ADX trend threshold", minval=5, group=grp_regime)
+bbw_period         = input.int(20, "BBW period", minval=2, group=grp_regime)
+achi_pct_win       = input.int(100, "Percentile window", minval=20, group=grp_regime)
+
+show_levels   = input.bool(true, "Show objective levels", group=grp_levels)
+show_lines    = input.bool(true, "Draw lines on chart", group=grp_levels)
+show_opens    = input.bool(true, "Show D/W/M opens", group=grp_levels)
+show_vwap     = input.bool(true, "Show session VWAP", group=grp_levels)
+show_labels   = input.bool(true, "Show level name tags on lines", group=grp_levels)
+lev_width     = input.int(1, "Line width (1-4)", minval=1, maxval=4, group=grp_levels)
+lev_style     = input.string("solid", "Line style", options=["solid", "dashed", "dotted"], group=grp_levels)
+lev_touch_tol = input.float(0.10, "Touch tolerance (ATR)", minval=0.01, maxval=1.0, step=0.01, group=grp_levels)
+lev_min_touches = input.int(0, "Min touch count (0 = show all levels)", minval=0, maxval=50, group=grp_levels)
+lev_min_strength = input.float(0.0, "Min strength 0-1 (0 = show all levels)", minval=0.0, maxval=1.0, step=0.05, group=grp_levels)
+lev_max_lines   = input.int(15, "Max lines to draw", minval=1, maxval=100, group=grp_levels)
+
+
+dark_theme = input.bool(true, "DarkTheme colors", group=grp_display)
+
+// ============================================================================
+// THEME
+// ============================================================================
+col_bg    = dark_theme ? color.new(#0e1117, 0) : color.white
+col_bull  = color.new(#4caf50, 0)
+col_bear  = color.new(#ef5350, 0)
+col_swing = color.new(#90a4ae, 0)
+col_txt   = dark_theme ? color.white : color.black
+col_level = dark_theme ? color.new(#7e57c2, 0) : color.new(#5e35b1, 0)
+col_vwap  = color.new(#29b6f6, 0)
+col_comp  = color.new(#ffb300, 0)
+col_range = color.new(#78909c, 0)
+
+// per-level-type colors
+col_pdh   = color.new(#ef5350, 20)
+col_pdl   = color.new(#4caf50, 20)
+col_pwh   = color.new(#9c27b0, 20)
+col_pwl   = color.new(#9c27b0, 20)
+col_pmh   = color.new(#3f51b5, 20)
+col_pml   = color.new(#3f51b5, 20)
+col_open  = color.new(#90a4ae, 20)
+col_sess  = color.new(#ff9800, 20)
+
+// ============================================================================
+// SWING DETECTION  (mirrors Python: detect_swings(k))
+//   ta.pivothigh/low confirm k bars after the pivot bar → no look-ahead.
+// ============================================================================
+pivHiRaw = ta.pivothigh(high, swing_k, swing_k)
+pivLoRaw = ta.pivotlow (low,  swing_k, swing_k)
+
+pivotHiPrice = ta.valuewhen(not na(pivHiRaw), pivHiRaw, 0)
+pivotLoPrice = ta.valuewhen(not na(pivLoRaw), pivLoRaw, 0)
+pivotHiBar   = ta.valuewhen(not na(pivHiRaw), bar_index - swing_k, 0)
+pivotLoBar   = ta.valuewhen(not na(pivLoRaw), bar_index - swing_k, 0)
+
+// Previous confirmed swings (for HH/LH and HL/LL comparisons + BOS/CHoCH)
+pivotHiPricePrev = ta.valuewhen(not na(pivHiRaw), pivHiRaw, 1)
+pivotLoPricePrev = ta.valuewhen(not na(pivLoRaw), pivLoRaw, 1)
+
+// ============================================================================
+// STRUCTURE CLASSIFICATION  (mirrors classify_structure)
+//   - compare confirmed pivot vs prior confirmed one (same-type) → HH/LH, HL/LL
+//   - BOS = price closes beyond last opposite-type confirmed pivot
+//   - CHoCH = BOS against the prevailing bias
+// ============================================================================
+var string lastBias = "NONE"          // "UP" | "DOWN" | "NONE"
+var float lastConfHi = na
+var float lastConfLo = na
+
+isHH = not na(pivHiRaw) and not na(pivotHiPricePrev) and pivHiRaw > pivotHiPricePrev
+isLH = not na(pivHiRaw) and not na(pivotHiPricePrev) and pivHiRaw < pivotHiPricePrev
+isHL = not na(pivLoRaw) and not na(pivotLoPricePrev) and pivLoRaw > pivotLoPricePrev
+isLL = not na(pivLoRaw) and not na(pivotLoPricePrev) and pivLoRaw < pivotLoPricePrev
+
+// Track last confirmed same-type pivot *price* as BOS reference
+lastConfHi := not na(pivHiRaw) ? pivHiRaw : lastConfHi
+lastConfLo := not na(pivLoRaw) ? pivLoRaw : lastConfLo
+
+// BOS/CHoCH on close
+bosUp   = ta.crossover (close, lastConfHi)
+bosDown = ta.crossunder(close, lastConfLo)
+
+chochUp   = bosUp   and lastBias == "DOWN"
+chochDown = bosDown and lastBias == "UP"
+
+// Update bias on confirmed structure events (HH/HL trend-up, LH/LL trend-down)
+if isHH or isHL
+    lastBias := "UP"
+else if isLH or isLL
+    lastBias := "DOWN"
+// CHoCH flips bias
+if chochUp
+    lastBias := "UP"
+if chochDown
+    lastBias := "DOWN"
+
+// ============================================================================
+// TREND ENGINE — 6 INDEPENDENT VOTES (mirrors market/trend/build_trend_reading)
+// ============================================================================
+// 1. structure (bias state of last two same-type pivots)
+structDir = (isHH or isHL) ? 1 : (isLH or isLL) ? -1 : (lastBias == "UP" ? 1 : lastBias == "DOWN" ? -1 : 0)
+// 2. EMA relationship
+eFast = ta.ema(close, ema_fast)
+eSlow = ta.ema(close, ema_slow)
+emaDir = eFast > eSlow ? 1 : eFast < eSlow ? -1 : 0
+// 3. momentum
+ret = close / close[mom_lookback] - 1.0
+momDir = ret > 0 ? 1 : ret < 0 ? -1 : 0
+// 4. volatility (direction-less, shown only)
+atrV = ta.atr(adx_period)
+atrPct = atrV / close * 100.0
+// 5. VWAP (session-anchored: ta.vwap handles reset; v6's ta.vwap needs no source)
+vwapV = ta.vwap(close)
+vwapDir = close > vwapV ? 1 : close < vwapV ? -1 : 0
+// 6. participation
+relVol = volume / ta.sma(volume, vol_ma)
+
+// vote aggregation (mirrors Python: display = majority, report agreement)
+votes = structDir + emaDir + momDir + vwapDir
+trendDir = votes > 0 ? "UP" : votes < 0 ? "DOWN" : "NEUTRAL"
+agreement = math.abs(votes) / 4.0   // 4 directional signals
+
+// ============================================================================
+// REGIME ENGINE  (mirrors classify_regime — precedence order preserved)
+// ============================================================================
+// ADX (ta.dmi returns [+DI, -DI, ADX])
+[diPlus, diMinus, adxV] = ta.dmi(adx_period, adx_period)
+
+// Bollinger Bandwidth percentile (ta.bb returns [middle, upper, lower])
+[bbMid, bbUp, bbLo] = ta.bb(close, bbw_period, 2)
+bbw = (bbUp - bbLo) / bbMid
+bbwPctile = ta.percentrank(bbw, achi_pct_win) / 100.0
+
+// ATR-percentile (of ATR% series)
+atrPctile = ta.percentrank(atrPct, achi_pct_win) / 100.0
+
+// linear-pathiness guard (mirrors Python guard: clean trend trumps tiny BBW)
+momentumSign = close > ta.ema(close, adx_period) ? 1 : close < ta.ema(close, adx_period) ? -1 : 0
+
+regime = "UNKNOWN"
+regimeConf = 0.0
+if bbwPctile <= 0.20 and adxV < adx_trend_thresh * 2
+    regime := "COMPRESSION"
+    regimeConf := 1.0 - bbwPctile / 0.20
+else if atrPctile >= 0.80 and adxV < adx_trend_thresh
+    regime := "HIGH_VOL"
+    regimeConf := math.min(1.0, (atrPctile - 0.80) / 0.20 + 0.5)
+else if atrPctile <= 0.20 and adxV < adx_trend_thresh
+    regime := "LOW_VOL"
+    regimeConf := 1.0 - atrPctile / 0.20
+else if adxV >= adx_trend_thresh and momentumSign != 0
+    regime := momentumSign > 0 ? "TRENDING_BULL" : "TRENDING_BEAR"
+    regimeConf := math.min(1.0, adxV / 50.0 + 0.3)
+else if adxV < adx_trend_thresh
+    regime := "RANGE"
+    regimeConf := 1.0 - adxV / adx_trend_thresh
+
+regimeColor = regime == "TRENDING_BULL" ? col_bull :
+              regime == "TRENDING_BEAR" ? col_bear :
+              regime == "COMPRESSION"   ? col_comp :
+              regime == "RANGE"         ? col_range :
+              color.new(#90a4ae, 40)
+
+// ============================================================================
+// OBJECTIVE LEVELS  (PDH/PDL/PWH/PWL/PMH/PML + opens + session + VWAP + POC)
+// ============================================================================
+// Prior-period extremes via explicit request.security with lookahead_off
+[pdh, pdl] = request.security(syminfo.tickerid, "D",  [high[1], low[1]],  lookahead=barmerge.lookahead_off)
+[pwh, pwl] = request.security(syminfo.tickerid, "W",  [high[1], low[1]],  lookahead=barmerge.lookahead_off)
+[pmh, pml] = request.security(syminfo.tickerid, "M",  [high[1], low[1]],  lookahead=barmerge.lookahead_off)
+
+// Period opens (current period)
+dOpen = ta.valuewhen(ta.change(time("D")) != 0, open, 0)
+wOpen = ta.valuewhen(ta.change(time("W")) != 0, open, 0)
+mOpen = ta.valuewhen(ta.change(time("M")) != 0, open, 0)
+
+// Session extremes (calendar day, UTC)
+minsPerBar = math.max(1, math.round(timeframe.in_seconds() / 60))
+barsPerDay = math.max(1, math.round(1440 / minsPerBar))
+sessHi = ta.highest(high, barsPerDay)
+sessLo = ta.lowest(low,  barsPerDay)
+
+// Volume profile POC — rolling 24×base-tf lookback: price (hl2) of the bar
+// with the highest volume in the window (a real price, unlike hl2*volume).
+profileWindow = math.max(20, 24 * barsPerDay)
+pocPrice = ta.valuewhen(volume == ta.highest(volume, profileWindow), hl2, 0)
+
+// ============================================================================
+// LEVEL LINES — type, price, strength, touch_count; filterable, drawn causal.
+// ============================================================================
+// Fern (frame|level) struct: draws each objective level once + supports filter.
+touchAtrAbs = atrV * lev_touch_tol
+levelStyle = lev_style == "dashed" ? line.style_dashed : lev_style == "dotted" ? line.style_dotted : line.style_solid
+
+// Strength scales with proximity to current price (nearer = stronger, max 1.0).
+mkSt(px) =>
+    math.min(1.0, 1.0 - math.abs(close - px) / (10.0 * atrV))
+
+// Concrete arrays populated at draw-time
+var array<string> nm   = array.new_string(0)
+var array<float>  pr   = array.new_float(0)
+var array<float>  st   = array.new_float(0)
+var array<color>  cl   = array.new_color(0)
+var array<int>    tc   = array.new_int(0)
+
+// helper: push a row (global scope — Pine requires functions at global scope)
+addLevel(nmArr, prArr, stArr, clArr, tcArr, nCode, p, strength, colr, tcount) =>
+    array.push(nmArr, nCode)
+    array.push(prArr, p)
+    array.push(stArr, strength)
+    array.push(clArr, colr)
+    array.push(tcArr, tcount)
+
+// Repopulate candidates on the last bar (draw-time)
+if barstate.islast and show_levels and show_lines
+    array.clear(nm)
+    array.clear(pr)
+    array.clear(st)
+    array.clear(cl)
+    array.clear(tc)
+
+    addLevel(nm, pr, st, cl, tc, "PDH", pdh,   mkSt(pdh),   col_pdh,   1)
+    addLevel(nm, pr, st, cl, tc, "PDL", pdl,   mkSt(pdl),   col_pdl,   1)
+    addLevel(nm, pr, st, cl, tc, "PWH", pwh,   mkSt(pwh),   col_pwh,   1)
+    addLevel(nm, pr, st, cl, tc, "PWL", pwl,   mkSt(pwl),   col_pwl,   1)
+    addLevel(nm, pr, st, cl, tc, "PMH", pmh,   mkSt(pmh),   col_pmh,   1)
+    addLevel(nm, pr, st, cl, tc, "PML", pml,   mkSt(pml),   col_pml,   1)
+    addLevel(nm, pr, st, cl, tc, "D_OPEN",  dOpen,  mkSt(dOpen),  col_open, 1)
+    addLevel(nm, pr, st, cl, tc, "W_OPEN",  wOpen,  mkSt(wOpen),  col_open, 1)
+    addLevel(nm, pr, st, cl, tc, "M_OPEN",  mOpen,  mkSt(mOpen),  col_open, 1)
+    addLevel(nm, pr, st, cl, tc, "SESS_HI", sessHi, mkSt(sessHi), col_sess, 1)
+    addLevel(nm, pr, st, cl, tc, "SESS_LO", sessLo, mkSt(sessLo), col_sess, 1)
+    addLevel(nm, pr, st, cl, tc, "VWAP",    vwapV,  mkSt(vwapV),  col_vwap, 1)
+    addLevel(nm, pr, st, cl, tc, "POC",     pocPrice, mkSt(pocPrice), col_level, 1)
+
+    // Estimate touch counts over the last `barsPerDay`-window: bar midpoint
+    // inside ±lev_touch_tol*ATR of level counts as a touch.
+    touchWindow = math.min(barsPerDay, 2000)     // guard against max_bars_back
+    for i = 0 to array.size(nm) - 1
+        price_i = array.get(pr, i)
+        if price_i > 0
+            crosses = 0
+            for j = 0 to touchWindow - 1
+                mid = (high[j] + low[j]) / 2.0
+                if mid > price_i - touchAtrAbs and mid < price_i + touchAtrAbs
+                    crosses += 1
+            array.set(tc, i, crosses)
+
+    // Filter by strength + touch + existence
+    idxList = array.new_int(0)
+    for i = 0 to array.size(nm) - 1
+        p = array.get(pr, i)
+        s = array.get(st, i)
+        t = array.get(tc, i)
+        pass = not na(p) and p > 0 and s >= lev_min_strength and t >= lev_min_touches
+        if pass
+            array.push(idxList, i)
+
+    // Cap by max_lines, prioritising strength descending (selection sort).
+
+    drawn = 0
+    rows_n = array.size(idxList)
+    used = array.new_bool(rows_n)
+    for k = 1 to lev_max_lines
+        best = -1
+        bestStr = -1.0
+        for a = 0 to array.size(idxList) - 1
+            idx = array.get(idxList, a)
+            s = array.get(st, idx)
+            if not array.get(used, a) and s > bestStr
+                bestStr := s
+                best := a
+        if best < 0
+            break
+        array.set(used, best, true)
+        idx = array.get(idxList, best)
+        price_i = array.get(pr, idx)
+        name_i  = array.get(nm, idx)
+        col_i   = array.get(cl, idx)
+        t_i     = array.get(tc, idx)
+        // Draw level line (from ~lookback bars back, extended right only)
+        line.new(bar_index - barsPerDay, price_i, bar_index, price_i,
+                 extend.extend.right, color=col_i, width=lev_width, style=levelStyle)
+        if show_labels
+            label.new(bar_index + 2, price_i, name_i + " t" + str.tostring(t_i) + " s" + str.tostring(bestStr, "#.##"),
+                      style=label.style_none, color=color.new(col_i, 100),
+                      textcolor=color.new(col_i, 0), size=size.tiny)
+        drawn += 1
+
+// Keep legacy summary table for quick numeric reference
+var table tLevels = table.new(position.bottom_right, 2, 12, bgcolor=color.new(col_bg, 85), border_width=1, border_color=color.new(col_txt, 70))
+if show_levels and barstate.islast
+    table.cell(tLevels, 0, 0,  "Level",      text_color=col_txt, text_size=size.small)
+    table.cell(tLevels, 1, 0,  "Price",      text_color=col_txt, text_size=size.small)
+    rowsT = array.from("PDH","PDL","PWH","PWL","PMH","PML","Day Open","Week Open","Month Open","Session H","Session L")
+    valsT = array.from(pdh, pdl, pwh, pwl, pmh, pml, dOpen, wOpen, mOpen, sessHi, sessLo)
+    for i = 0 to array.size(rowsT) - 1
+        table.cell(tLevels, 0, i + 1, array.get(rowsT, i), text_color=col_level, text_size=size.small)
+        table.cell(tLevels, 1, i + 1, str.tostring(array.get(valsT, i), format.mintick), text_color=col_txt, text_size=size.small)
+
+// ============================================================================
+// RENDERING — swings, structure labels, BOS/CHoCH markers, trend+regime panels
+// ============================================================================
+// swing markers on the pivot bar (ta.pivothigh returns at the pivot price;
+// markers drawn `swing_k` bars back to sit on the actual extreme)
+plotshape(show_swings and not na(pivHiRaw), title="Swing High", location=location.abovebar, offset=-swing_k, style=shape.triangledown, color=col_bear, size=size.tiny, text="", editable=false)
+plotshape(show_swings and not na(pivLoRaw), title="Swing Low",  location=location.belowbar, offset=-swing_k, style=shape.triangleup,   color=col_bull, size=size.tiny, text="", editable=false)
+
+// HH/HL/LH/LL labels (on pivot bar, delayed by nature → offset -swing_k)
+plotshape(show_events and isHH, title="HH", location=location.abovebar, offset=-swing_k, style=shape.labelup,   color=col_bull, text="HH",  textcolor=color.white, size=size.tiny, editable=false)
+plotshape(show_events and isLH, title="LH", location=location.abovebar, offset=-swing_k, style=shape.labelup,   color=col_bear, text="LH",  textcolor=color.white, size=size.tiny, editable=false)
+plotshape(show_events and isHL, title="HL", location=location.belowbar, offset=-swing_k, style=shape.labeldown, color=col_bull, text="HL",  textcolor=color.white, size=size.tiny, editable=false)
+plotshape(show_events and isLL, title="LL", location=location.belowbar, offset=-swing_k, style=shape.labeldown, color=col_bear, text="LL",  textcolor=color.white, size=size.tiny, editable=false)
+
+plotshape(show_events and bosUp,   title="BOS↑",    location=location.belowbar, style=shape.triangleup,   color=col_bull, text="",  size=size.small, editable=false)
+plotshape(show_events and bosDown, title="BOS↓",    location=location.abovebar, style=shape.triangledown, color=col_bear, text="",  size=size.small, editable=false)
+plotshape(show_events and chochUp,   title="CHoCH↑", location=location.belowbar, style=shape.diamond,     color=col_bull, text="CH", textcolor=color.white, size=size.small, editable=false)
+plotshape(show_events and chochDown, title="CHoCH↓", location=location.abovebar, style=shape.diamond,     color=col_bear, text="CH", textcolor=color.white, size=size.small, editable=false)
+
+// VWAP
+plot(show_vwap ? vwapV : na, "VWAP (session)", color=col_vwap, linewidth=2)
+
+// Color bars by regime (subtle) — explicit boolean, no `in` for tuples
+isTrending = regime == "TRENDING_BULL" or regime == "TRENDING_BEAR"
+barcolor(isTrending ? color.new(regimeColor, 60) : na)
+
+// Trend + regime panels
+var table tInfo = table.new(position.top_right, 2, 8, bgcolor=color.new(col_bg, 85), border_width=1, border_color=color.new(col_txt, 70))
+if show_trend_panel and barstate.islast
+    table.cell(tInfo, 0, 0, "TREND",        text_color=col_txt,   text_size=size.small)
+    table.cell(tInfo, 1, 0, trendDir + " (" + str.tostring(agreement * 100, "#") + "% agree)", text_color=trendDir == "UP" ? col_bull : trendDir == "DOWN" ? col_bear : color.gray, text_size=size.small)
+    table.cell(tInfo, 0, 1, "struct", text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 1, 1, structDir > 0 ? "UP" : structDir < 0 ? "DOWN" : "NEUTRAL", text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 0, 2, "ema",    text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 1, 2, emaDir   > 0 ? "UP" : emaDir   < 0 ? "DOWN" : "NEUTRAL", text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 0, 3, "mom",    text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 1, 3, momDir   > 0 ? "UP" : momDir   < 0 ? "DOWN" : "NEUTRAL", text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 0, 4, "vwap",   text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 1, 4, vwapDir  > 0 ? "UP" : vwapDir  < 0 ? "DOWN" : "NEUTRAL", text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 0, 5, "relVol", text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 1, 5, str.tostring(relVol, "#.##") + "x", text_color=col_txt, text_size=size.tiny)
+
+if show_regime_panel and barstate.islast
+    table.cell(tInfo, 0, 6, "REGIME", text_color=col_txt,  text_size=size.small)
+    table.cell(tInfo, 1, 6, regime + " (" + str.tostring(regimeConf * 100, "#") + "%)", text_color=regimeColor, text_size=size.small)
+    table.cell(tInfo, 0, 7, "adx / bbw%", text_color=col_txt, text_size=size.tiny)
+    table.cell(tInfo, 1, 7, str.tostring(adxV, "#.#") + " / " + str.tostring(bbwPctile, "#.#"), text_color=col_txt, text_size=size.tiny)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(bosUp,     title="BOS Up",    message="TIP v6: Bullish BOS on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(bosDown,   title="BOS Down",  message="TIP v6: Bearish BOS on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(chochUp,   title="CHoCH Up",  message="TIP v6: Bullish CHoCH on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(chochDown, title="CHoCH Down",message="TIP v6: Bearish CHoCH on {{ticker}} ({{interval}}) @ {{close}}")
+
+// ============================================================================
+// NOTES (why v6, and what's mirrored from the research platform)
+//   • ta.pivothigh/pivotlow inherently enforce k-bar delayed confirmation, the
+//     exact invariant of detect_swings(k) — no repaint.
+//   • request.security uses barmerge.lookahead_off: prior-period levels are
+//     strictly backward-looking (matches resample_bars closed-candle rule).
+//   • Regime precedence mirrors Python: compression→vol-extremes→trend→range,
+//     with the ADX-trend guard that prevents noise-free linear ramps from being
+//     labelled COMPRESSION (matches classify_regime).
+//   • Trend stays 6 independent votes (structure/ema/momentum/volatility/
+//     vwap/volume-participation); agreement % = fraction aligned, no fused score.
+//   • Levels engine keeps prior-day/week/month extremes, opens, session hi/lo,
+//     session VWAP, and a rolling POC proxy — the same "objective levels first"
+//     contract as the Python LevelEngine.
+// ============================================================================
