@@ -41,6 +41,7 @@ analysis / sharing, but not for daily trading.
 indicator works on any symbol. Switch from AMD to BTCUSDT.P to SOLUSDT.P
 and it auto-detects fresh levels every time.
 
+<<<<<<< HEAD
 ### `institutional_engine_v6.pine`  *(full market-structure engine)*
 
 Complete Pine v6 port of the institutional trading engine: swing
@@ -89,6 +90,37 @@ PMH/PML, D/W/M opens, session hi/lo, session VWAP, rolling POC).
 **Install / use** — same steps as below; settings groups: Swing
 Detection, Market Structure, Trend Engine, Regime Engine, Objective
 Levels, Display.
+
+### `ti_smc_v6.pine` — Institutional SMC indicator
+
+Pine v6 indicator ("Trading Intelligence [Institutional SMC]") mirroring
+an institutional market-structure + smart-money-concepts engine.
+
+**What it does**
+
+- **Market structure** — N-bar fractal swings (HH/HL/LH/LL with ATR-based
+  significance), BOS (break of structure, continuation) vs CHoCH (change
+  of character, reversal) with displacement filters, trend state from the
+  recent swing sequence.
+- **Order blocks** — last opposite candle before an impulsive move,
+  unmitigated-only option, boxed and shaded.
+- **Fair value gaps** — 3-candle gaps filtered by ATR multiple, unmitigated
+  tracking.
+- **Liquidity** — equal-high/equal-low pools (BSL/SSL) plus sweep labels
+  with reaction confirmation.
+- **Trend engine** — composite score [-1,+1] from swing + EMA-stack + ADX
+  components (35/35/30 weights).
+- **Regime engine** — TRENDING / RANGING / EXPANSION / COMPRESSION from
+  ATR-percentile ratio and trend score.
+- **VWAP** — session-reset cumulative VWAP with 1σ/2σ bands.
+- **S/R confluence** — swing levels + VWAP + round numbers clustered
+  within ATR tolerance, top N displayed.
+- Info table (trend/regime/structure/last event/VWAP/ATR), trend
+  background tint, 7 alertconditions (BOS, CHoCH, sweeps, regime change).
+
+**Install / use** — same steps as below; settings groups: Market
+Structure, Order Blocks, Fair Value Gaps, Liquidity Pools, Trend & Bias,
+Regime Detection, VWAP, Support & Resistance, Colors.
 
 ## How to install
 

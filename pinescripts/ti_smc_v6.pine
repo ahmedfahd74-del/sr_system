@@ -1,0 +1,811 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Trading Intelligence System
+// Institutional Grade Market Structure & Smart Money Concepts Indicator
+// Pine Script v6 — Mirrors the trading_intelligence Python engine logic
+
+//@version=6
+indicator("Trading Intelligence [Institutional SMC]", "TI-SMC", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- Market Structure ---
+grpStructure = "══ Market Structure ══"
+i_swingLeft      = input.int(3, "Pivot Left Bars", minval=1, maxval=10, group=grpStructure, tooltip="N-bar fractal: bars required on left side of pivot")
+i_swingRight     = input.int(3, "Pivot Right Bars", minval=1, maxval=10, group=grpStructure, tooltip="N-bar fractal: bars required on right side for confirmation")
+i_sigAtrMult     = input.float(1.5, "Significance ATR Multiple", minval=0.5, maxval=5.0, step=0.1, group=grpStructure, tooltip="Swing must move >= this * ATR to be significant")
+i_dispAtrMult    = input.float(1.0, "Displacement ATR Multiple", minval=0.5, maxval=3.0, step=0.1, group=grpStructure, tooltip="BOS/CHoCH requires displacement >= this * ATR")
+i_showSwings     = input.bool(true, "Show Swing Labels", group=grpStructure)
+i_showBOS        = input.bool(true, "Show BOS/CHoCH", group=grpStructure)
+
+// --- Order Blocks ---
+grpOB = "══ Order Blocks ══"
+i_showOB         = input.bool(true, "Show Order Blocks", group=grpOB)
+i_obLookback     = input.int(50, "OB Lookback", minval=10, maxval=200, group=grpOB)
+i_obDispMult     = input.float(1.5, "OB Displacement Multiple", minval=0.5, maxval=3.0, step=0.1, group=grpOB)
+i_obMitigation   = input.bool(true, "Show Only Unmitigated OBs", group=grpOB)
+
+// --- Fair Value Gaps ---
+grpFVG = "══ Fair Value Gaps ══"
+i_showFVG        = input.bool(true, "Show FVGs", group=grpFVG)
+i_fvgMinMult     = input.float(0.5, "FVG Min Gap ATR Multiple", minval=0.1, maxval=2.0, step=0.1, group=grpFVG)
+i_fvgLookback    = input.int(50, "FVG Lookback", minval=10, maxval=200, group=grpFVG)
+i_fvgMitigation  = input.bool(true, "Show Only Unmitigated FVGs", group=grpFVG)
+
+// --- Liquidity ---
+grpLiq = "══ Liquidity Pools ══"
+i_showLiquidity  = input.bool(true, "Show Liquidity Pools", group=grpLiq)
+i_eqTolMult      = input.float(0.3, "Equal Highs/Lows Tolerance ATR", minval=0.1, maxval=1.0, step=0.1, group=grpLiq)
+i_minPoolTouches = input.int(2, "Min Pool Touches", minval=2, maxval=5, group=grpLiq)
+i_showSweeps     = input.bool(true, "Show Liquidity Sweeps", group=grpLiq)
+
+// --- Trend & Bias ---
+grpTrend = "══ Trend & Bias ══"
+i_showTrend      = input.bool(true, "Show Trend Background", group=grpTrend)
+i_emaFast        = input.int(9, "EMA Fast", minval=5, maxval=50, group=grpTrend)
+i_emaMid         = input.int(21, "EMA Mid", minval=10, maxval=100, group=grpTrend)
+i_emaSlow        = input.int(50, "EMA Slow", minval=20, maxval=200, group=grpTrend)
+i_adxPeriod      = input.int(14, "ADX Period", minval=7, maxval=30, group=grpTrend)
+i_showEMA        = input.bool(false, "Show EMAs", group=grpTrend)
+
+// --- Regime ---
+grpRegime = "══ Regime Detection ══"
+i_showRegime     = input.bool(true, "Show Regime Label", group=grpRegime)
+i_atrPeriod      = input.int(14, "ATR Period", minval=7, maxval=50, group=grpRegime)
+i_atrPctilePer   = input.int(100, "ATR Percentile Lookback", minval=20, maxval=500, group=grpRegime)
+
+// --- VWAP ---
+grpVWAP = "══ VWAP ══"
+i_showVWAP       = input.bool(true, "Show Session VWAP", group=grpVWAP)
+i_vwapBands      = input.bool(true, "Show VWAP Bands (1σ, 2σ)", group=grpVWAP)
+
+// --- Support/Resistance ---
+grpSR = "══ Support & Resistance ══"
+i_showSR         = input.bool(true, "Show Key Levels", group=grpSR)
+i_srClusterTol   = input.float(0.5, "S/R Cluster Tolerance ATR", minval=0.1, maxval=2.0, step=0.1, group=grpSR)
+i_maxLevels      = input.int(8, "Max Levels to Show", minval=1, maxval=20, group=grpSR)
+
+// --- Colors ---
+grpColors = "══ Colors ══"
+i_bullColor      = input.color(#26a69a, "Bullish Color", group=grpColors)
+i_bearColor      = input.color(#ef5350, "Bearish Color", group=grpColors)
+i_neutralColor   = input.color(#787b86, "Neutral Color", group=grpColors)
+i_obBullColor    = input.color(color.new(#26a69a, 80), "OB Bullish", group=grpColors)
+i_obBearColor    = input.color(color.new(#ef5350, 80), "OB Bearish", group=grpColors)
+i_fvgBullColor   = input.color(color.new(#2962ff, 85), "FVG Bullish", group=grpColors)
+i_fvgBearColor   = input.color(color.new(#ff6d00, 85), "FVG Bearish", group=grpColors)
+i_liqColor       = input.color(color.new(#e91e63, 70), "Liquidity Pool", group=grpColors)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TYPES & CONSTANTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+type Swing
+    int     idx
+    float   price
+    bool    isHigh
+    string  kind      // "HH", "HL", "LH", "LL", "H", "L"
+    float   strength
+    bool    swept
+
+type Zone
+    int     startIdx
+    float   top
+    float   bottom
+    bool    isBullish
+    bool    mitigated
+    string  zoneType  // "OB", "FVG", "LIQ"
+    box     boxObj
+
+type Level
+    float   price
+    string  kind
+    float   strength
+    int     createdIdx
+    line    lineObj
+
+// Trend states
+var string TREND_UP    = "UP"
+var string TREND_DOWN  = "DOWN"
+var string TREND_RANGE = "RANGE"
+
+// Structure events
+var string EVENT_NONE     = "NONE"
+var string EVENT_BOS_UP   = "BOS_UP"
+var string EVENT_BOS_DOWN = "BOS_DOWN"
+var string EVENT_CHOCH_UP = "CHOCH_UP"
+var string EVENT_CHOCH_DN = "CHOCH_DOWN"
+
+// Regime states
+var string REGIME_TRENDING    = "TRENDING"
+var string REGIME_RANGING     = "RANGING"
+var string REGIME_EXPANSION   = "EXPANSION"
+var string REGIME_COMPRESSION = "COMPRESSION"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CORE INDICATORS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ATR for various calculations
+atrVal = ta.atr(i_atrPeriod)
+
+// EMAs for trend
+emaFast = ta.ema(close, i_emaFast)
+emaMid  = ta.ema(close, i_emaMid)
+emaSlow = ta.ema(close, i_emaSlow)
+
+// ADX for trend strength
+[diPlus, diMinus, adxVal] = ta.dmi(i_adxPeriod, i_adxPeriod)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE — SWING DETECTION (N-bar Fractals)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Pivot detection using ta.pivothigh/ta.pivotlow (confirmed after right bars close)
+pivotHigh = ta.pivothigh(high, i_swingLeft, i_swingRight)
+pivotLow  = ta.pivotlow(low, i_swingLeft, i_swingRight)
+
+// Track swings
+var array<Swing> swings = array.new<Swing>()
+var float lastSwingHighPrice = na
+var float lastSwingLowPrice  = na
+var int   lastSwingHighIdx   = na
+var int   lastSwingLowIdx    = na
+
+// Process new pivot high
+if not na(pivotHigh)
+    int pivIdx = bar_index - i_swingRight
+    float pivPrice = pivotHigh
+    
+    // Calculate prominence (simplified: distance from last opposite swing)
+    float prominence = na(lastSwingLowPrice) ? pivPrice * 0.01 : math.abs(pivPrice - lastSwingLowPrice)
+    float atrAtPiv = nz(atrVal[i_swingRight], atrVal)
+    float strength = math.min(1.0, prominence / (i_sigAtrMult * atrAtPiv * 2 + 0.0001))
+    
+    // Classify: HH or LH
+    string kind = "H"
+    if not na(lastSwingHighPrice)
+        kind := pivPrice > lastSwingHighPrice ? "HH" : "LH"
+    
+    // Create swing
+    Swing newSwing = Swing.new(pivIdx, pivPrice, true, kind, strength, false)
+    array.push(swings, newSwing)
+    
+    // Update tracking
+    lastSwingHighPrice := pivPrice
+    lastSwingHighIdx   := pivIdx
+    
+    // Draw label
+    if i_showSwings
+        labelColor = kind == "HH" ? i_bullColor : kind == "LH" ? i_bearColor : i_neutralColor
+        label.new(pivIdx, pivPrice, kind, xloc.bar_index, yloc.abovebar, labelColor, label.style_label_down, color.white, size.small)
+
+// Process new pivot low
+if not na(pivotLow)
+    int pivIdx = bar_index - i_swingRight
+    float pivPrice = pivotLow
+    
+    // Calculate prominence
+    float prominence = na(lastSwingHighPrice) ? pivPrice * 0.01 : math.abs(pivPrice - lastSwingHighPrice)
+    float atrAtPiv = nz(atrVal[i_swingRight], atrVal)
+    float strength = math.min(1.0, prominence / (i_sigAtrMult * atrAtPiv * 2 + 0.0001))
+    
+    // Classify: HL or LL
+    string kind = "L"
+    if not na(lastSwingLowPrice)
+        kind := pivPrice > lastSwingLowPrice ? "HL" : "LL"
+    
+    // Create swing
+    Swing newSwing = Swing.new(pivIdx, pivPrice, false, kind, strength, false)
+    array.push(swings, newSwing)
+    
+    // Update tracking
+    lastSwingLowPrice := pivPrice
+    lastSwingLowIdx   := pivIdx
+    
+    // Draw label
+    if i_showSwings
+        labelColor = kind == "HL" ? i_bullColor : kind == "LL" ? i_bearColor : i_neutralColor
+        label.new(pivIdx, pivPrice, kind, xloc.bar_index, yloc.belowbar, labelColor, label.style_label_up, color.white, size.small)
+
+// Limit swing array size
+if array.size(swings) > 100
+    array.shift(swings)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE — TREND STATE & BOS/CHoCH DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+var string currentTrend = TREND_RANGE
+var string lastEvent    = EVENT_NONE
+
+// Determine trend from recent swing sequence
+f_determineTrend() =>
+    string result = TREND_RANGE
+    int sz = array.size(swings)
+    if sz >= 4
+        // Get last 4 swings to determine pattern
+        Swing s1 = array.get(swings, sz - 4)
+        Swing s2 = array.get(swings, sz - 3)
+        Swing s3 = array.get(swings, sz - 2)
+        Swing s4 = array.get(swings, sz - 1)
+        
+        // Check for HH + HL pattern (uptrend)
+        bool hasHH = false
+        bool hasHL = false
+        bool hasLH = false
+        bool hasLL = false
+        
+        for i = sz - 4 to sz - 1
+            Swing sw = array.get(swings, i)
+            if sw.kind == "HH"
+                hasHH := true
+            if sw.kind == "HL"
+                hasHL := true
+            if sw.kind == "LH"
+                hasLH := true
+            if sw.kind == "LL"
+                hasLL := true
+        
+        if hasHH and hasHL and not hasLL
+            result := TREND_UP
+        else if hasLL and hasLH and not hasHH
+            result := TREND_DOWN
+    result
+
+currentTrend := f_determineTrend()
+
+// BOS / CHoCH Detection
+var float bosUpLevel   = na
+var float bosDnLevel   = na
+var float chochUpLevel = na
+var float chochDnLevel = na
+
+// Find the most recent swing high and swing low for BOS/CHoCH levels
+f_findRecentSwingHigh() =>
+    float result = na
+    int sz = array.size(swings)
+    for i = sz - 1 to 0
+        Swing sw = array.get(swings, i)
+        if sw.isHigh
+            result := sw.price
+            break
+    result
+
+f_findRecentSwingLow() =>
+    float result = na
+    int sz = array.size(swings)
+    for i = sz - 1 to 0
+        Swing sw = array.get(swings, i)
+        if not sw.isHigh
+            result := sw.price
+            break
+    result
+
+recentSwingHigh = f_findRecentSwingHigh()
+recentSwingLow  = f_findRecentSwingLow()
+
+// BOS: Break of Structure (continuation)
+// In uptrend: close above the most recent swing high with displacement
+// In downtrend: close below the most recent swing low with displacement
+
+bosUpCondition = currentTrend == TREND_UP and not na(recentSwingHigh) and close > recentSwingHigh and (close - recentSwingHigh) >= i_dispAtrMult * atrVal
+bosDnCondition = currentTrend == TREND_DOWN and not na(recentSwingLow) and close < recentSwingLow and (recentSwingLow - close) >= i_dispAtrMult * atrVal
+
+// CHoCH: Change of Character (reversal)
+// In uptrend: close below the most recent HL
+// In downtrend: close above the most recent LH
+
+// Find most recent HL in uptrend
+f_findRecentHL() =>
+    float result = na
+    int sz = array.size(swings)
+    for i = sz - 1 to 0
+        Swing sw = array.get(swings, i)
+        if sw.kind == "HL"
+            result := sw.price
+            break
+    result
+
+// Find most recent LH in downtrend
+f_findRecentLH() =>
+    float result = na
+    int sz = array.size(swings)
+    for i = sz - 1 to 0
+        Swing sw = array.get(swings, i)
+        if sw.kind == "LH"
+            result := sw.price
+            break
+    result
+
+recentHL = f_findRecentHL()
+recentLH = f_findRecentLH()
+
+chochDnCondition = currentTrend == TREND_UP and not na(recentHL) and close < recentHL and (recentHL - close) >= i_dispAtrMult * atrVal
+chochUpCondition = currentTrend == TREND_DOWN and not na(recentLH) and close > recentLH and (close - recentLH) >= i_dispAtrMult * atrVal
+
+// Draw BOS/CHoCH
+if i_showBOS
+    if bosUpCondition and lastEvent != EVENT_BOS_UP
+        lastEvent := EVENT_BOS_UP
+        line.new(bar_index - 10, recentSwingHigh, bar_index, recentSwingHigh, xloc.bar_index, extend.none, i_bullColor, line.style_solid, 2)
+        label.new(bar_index, recentSwingHigh, "BOS ↑", xloc.bar_index, yloc.price, i_bullColor, label.style_label_left, color.white, size.tiny)
+    
+    if bosDnCondition and lastEvent != EVENT_BOS_DOWN
+        lastEvent := EVENT_BOS_DOWN
+        line.new(bar_index - 10, recentSwingLow, bar_index, recentSwingLow, xloc.bar_index, extend.none, i_bearColor, line.style_solid, 2)
+        label.new(bar_index, recentSwingLow, "BOS ↓", xloc.bar_index, yloc.price, i_bearColor, label.style_label_left, color.white, size.tiny)
+    
+    if chochUpCondition and lastEvent != EVENT_CHOCH_UP
+        lastEvent := EVENT_CHOCH_UP
+        currentTrend := TREND_UP
+        line.new(bar_index - 10, recentLH, bar_index, recentLH, xloc.bar_index, extend.none, i_bullColor, line.style_dashed, 2)
+        label.new(bar_index, recentLH, "CHoCH ↑", xloc.bar_index, yloc.price, i_bullColor, label.style_label_left, color.white, size.tiny)
+    
+    if chochDnCondition and lastEvent != EVENT_CHOCH_DN
+        lastEvent := EVENT_CHOCH_DN
+        currentTrend := TREND_DOWN
+        line.new(bar_index - 10, recentHL, bar_index, recentHL, xloc.bar_index, extend.none, i_bearColor, line.style_dashed, 2)
+        label.new(bar_index, recentHL, "CHoCH ↓", xloc.bar_index, yloc.price, i_bearColor, label.style_label_left, color.white, size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ORDER BLOCKS
+// ══════════════════════════════════════════════════════════════════════════════
+
+var array<Zone> orderBlocks = array.new<Zone>()
+
+// Detect Order Blocks
+// Bullish OB: Last down candle before an up-impulse leg
+// Bearish OB: Last up candle before a down-impulse leg
+
+f_detectOrderBlocks() =>
+    int n = bar_index
+    float dispThreshold = i_obDispMult * atrVal
+    
+    // Look for bullish OB: down candle followed by strong up move
+    // Check if current bar is a strong bullish bar
+    bool isBullishImpulse = close > open and (close - open) >= dispThreshold
+    bool prevWasDown = close[1] < open[1]
+    
+    if isBullishImpulse and prevWasDown
+        // Previous bar is a bullish OB candidate
+        Zone newOB = Zone.new(bar_index - 1, high[1], low[1], true, false, "OB", na)
+        array.push(orderBlocks, newOB)
+    
+    // Look for bearish OB: up candle followed by strong down move
+    bool isBearishImpulse = close < open and (open - close) >= dispThreshold
+    bool prevWasUp = close[1] > open[1]
+    
+    if isBearishImpulse and prevWasUp
+        // Previous bar is a bearish OB candidate
+        Zone newOB = Zone.new(bar_index - 1, high[1], low[1], false, false, "OB", na)
+        array.push(orderBlocks, newOB)
+
+if i_showOB
+    f_detectOrderBlocks()
+
+// Check for OB mitigation and draw
+f_processOrderBlocks() =>
+    int sz = array.size(orderBlocks)
+    if sz > 0
+        for i = sz - 1 to 0
+            Zone ob = array.get(orderBlocks, i)
+            
+            // Check mitigation: price trades through the zone
+            if not ob.mitigated
+                bool mitigated = (low <= ob.top and high >= ob.bottom) and bar_index > ob.startIdx
+                if mitigated
+                    ob.mitigated := true
+                    if not na(ob.boxObj)
+                        box.set_bgcolor(ob.boxObj, color.new(color.gray, 90))
+                    array.set(orderBlocks, i, ob)
+            
+            // Draw unmitigated OBs (or all if setting is off)
+            if not ob.mitigated or not i_obMitigation
+                if na(ob.boxObj) and bar_index - ob.startIdx <= i_obLookback
+                    boxColor = ob.isBullish ? i_obBullColor : i_obBearColor
+                    ob.boxObj := box.new(ob.startIdx, ob.top, bar_index + 10, ob.bottom, border_color=boxColor, bgcolor=boxColor, border_width=1, extend=extend.right)
+                    array.set(orderBlocks, i, ob)
+                else if not na(ob.boxObj)
+                    box.set_right(ob.boxObj, bar_index + 10)
+    
+    // Cleanup old OBs
+    if sz > 50
+        Zone oldest = array.shift(orderBlocks)
+        if not na(oldest.boxObj)
+            box.delete(oldest.boxObj)
+
+if i_showOB
+    f_processOrderBlocks()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FAIR VALUE GAPS (FVG)
+// ══════════════════════════════════════════════════════════════════════════════
+
+var array<Zone> fvgZones = array.new<Zone>()
+
+// Detect FVGs
+// Bullish FVG: low[0] > high[2] (gap up)
+// Bearish FVG: high[0] < low[2] (gap down)
+
+f_detectFVG() =>
+    float gapThreshold = i_fvgMinMult * atrVal
+    
+    // Bullish FVG
+    float bullGap = low - high[2]
+    if bullGap >= gapThreshold
+        Zone newFVG = Zone.new(bar_index - 1, low, high[2], true, false, "FVG", na)
+        array.push(fvgZones, newFVG)
+    
+    // Bearish FVG
+    float bearGap = low[2] - high
+    if bearGap >= gapThreshold
+        Zone newFVG = Zone.new(bar_index - 1, low[2], high, false, false, "FVG", na)
+        array.push(fvgZones, newFVG)
+
+if i_showFVG and bar_index >= 2
+    f_detectFVG()
+
+// Process FVGs
+f_processFVGs() =>
+    int sz = array.size(fvgZones)
+    if sz > 0
+        for i = sz - 1 to 0
+            Zone fvg = array.get(fvgZones, i)
+            
+            // Check mitigation
+            if not fvg.mitigated
+                bool mitigated = (low <= fvg.top and high >= fvg.bottom) and bar_index > fvg.startIdx
+                if mitigated
+                    fvg.mitigated := true
+                    if not na(fvg.boxObj)
+                        box.set_bgcolor(fvg.boxObj, color.new(color.gray, 95))
+                    array.set(fvgZones, i, fvg)
+            
+            // Draw
+            if not fvg.mitigated or not i_fvgMitigation
+                if na(fvg.boxObj) and bar_index - fvg.startIdx <= i_fvgLookback
+                    boxColor = fvg.isBullish ? i_fvgBullColor : i_fvgBearColor
+                    fvg.boxObj := box.new(fvg.startIdx, fvg.top, bar_index + 5, fvg.bottom, border_color=boxColor, bgcolor=boxColor, border_width=1, border_style=line.style_dotted, extend=extend.right)
+                    array.set(fvgZones, i, fvg)
+                else if not na(fvg.boxObj)
+                    box.set_right(fvg.boxObj, bar_index + 5)
+    
+    // Cleanup
+    if sz > 30
+        Zone oldest = array.shift(fvgZones)
+        if not na(oldest.boxObj)
+            box.delete(oldest.boxObj)
+
+if i_showFVG
+    f_processFVGs()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY POOLS — Equal Highs/Lows
+// ══════════════════════════════════════════════════════════════════════════════
+
+var array<Level> liquidityPools = array.new<Level>()
+
+// Detect equal highs/lows (liquidity resting above/below)
+f_detectLiquidityPools() =>
+    float tolerance = i_eqTolMult * atrVal
+    int lookback = 50
+    
+    // Check for equal highs (buy-side liquidity above)
+    int eqHighCount = 0
+    float refHigh = high
+    for i = 1 to lookback
+        if math.abs(high[i] - refHigh) <= tolerance
+            eqHighCount += 1
+    
+    if eqHighCount >= i_minPoolTouches - 1
+        // Found equal highs — create liquidity level
+        Level newPool = Level.new(refHigh, "LIQ_BSL", 0.7, bar_index, na)
+        array.push(liquidityPools, newPool)
+    
+    // Check for equal lows (sell-side liquidity below)
+    int eqLowCount = 0
+    float refLow = low
+    for i = 1 to lookback
+        if math.abs(low[i] - refLow) <= tolerance
+            eqLowCount += 1
+    
+    if eqLowCount >= i_minPoolTouches - 1
+        Level newPool = Level.new(refLow, "LIQ_SSL", 0.7, bar_index, na)
+        array.push(liquidityPools, newPool)
+
+// Run every 10 bars to avoid over-detection
+if i_showLiquidity and bar_index % 10 == 0
+    f_detectLiquidityPools()
+
+// Draw liquidity pools
+f_drawLiquidityPools() =>
+    int sz = array.size(liquidityPools)
+    if sz > 0
+        for i = sz - 1 to 0
+            Level pool = array.get(liquidityPools, i)
+            if na(pool.lineObj) and bar_index - pool.createdIdx <= 100
+                pool.lineObj := line.new(pool.createdIdx, pool.price, bar_index + 20, pool.price, xloc.bar_index, extend.right, i_liqColor, line.style_dotted, 1)
+                array.set(liquidityPools, i, pool)
+            else if not na(pool.lineObj)
+                line.set_x2(pool.lineObj, bar_index + 20)
+    
+    // Cleanup
+    if sz > 20
+        Level oldest = array.shift(liquidityPools)
+        if not na(oldest.lineObj)
+            line.delete(oldest.lineObj)
+
+if i_showLiquidity
+    f_drawLiquidityPools()
+
+// Liquidity Sweep Detection
+var bool bullishSweep = false
+var bool bearishSweep = false
+
+f_detectSweeps() =>
+    float sweepReversal = i_dispAtrMult * atrVal
+    bool bullSweep = false
+    bool bearSweep = false
+    
+    // Bearish sweep: High exceeds a swing high but closes back below
+    if not na(recentSwingHigh) and high > recentSwingHigh and close < recentSwingHigh and (recentSwingHigh - close) >= sweepReversal * 0.5
+        bearSweep := true
+    
+    // Bullish sweep: Low exceeds a swing low but closes back above
+    if not na(recentSwingLow) and low < recentSwingLow and close > recentSwingLow and (close - recentSwingLow) >= sweepReversal * 0.5
+        bullSweep := true
+    
+    [bullSweep, bearSweep]
+
+[bullSweepDetected, bearSweepDetected] = f_detectSweeps()
+
+if i_showSweeps
+    if bullSweepDetected and not bullishSweep
+        label.new(bar_index, low, "⚡ Sweep", xloc.bar_index, yloc.belowbar, i_bullColor, label.style_label_up, color.white, size.tiny)
+    if bearSweepDetected and not bearishSweep
+        label.new(bar_index, high, "⚡ Sweep", xloc.bar_index, yloc.abovebar, i_bearColor, label.style_label_down, color.white, size.tiny)
+
+bullishSweep := bullSweepDetected
+bearishSweep := bearSweepDetected
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TREND ENGINE — Composite Score
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Swing component: +1 uptrend, -1 downtrend, 0 range
+float swingComponent = currentTrend == TREND_UP ? 1.0 : currentTrend == TREND_DOWN ? -1.0 : 0.0
+
+// EMA component: stack alignment
+float emaVotes = 0.0
+emaVotes += emaFast > emaMid ? 1.0 : -1.0
+emaVotes += emaMid > emaSlow ? 1.0 : -1.0
+emaVotes += close > emaSlow ? 1.0 : -1.0
+float emaComponent = emaVotes / 3.0
+
+// ADX component: directional strength
+float adxStrength = math.min(1.0, adxVal / 40.0)
+float diSign = diPlus > diMinus ? 1.0 : -1.0
+float adxComponent = diSign * adxStrength
+
+// Composite trend score [-1, +1]
+float trendScore = (swingComponent * 0.35 + emaComponent * 0.35 + adxComponent * 0.30)
+trendScore := math.max(-1.0, math.min(1.0, trendScore))
+
+// Trend direction
+string trendDirection = trendScore > 0.25 ? TREND_UP : trendScore < -0.25 ? TREND_DOWN : TREND_RANGE
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REGIME ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ATR percentile for expansion/compression detection
+float atrPercentile = ta.percentile_nearest_rank(atrVal, i_atrPctilePer, 50)
+float atrRatio = atrVal / atrPercentile
+bool isExpansion = atrRatio > 1.2
+bool isCompression = atrRatio < 0.7
+
+// Regime classification
+string regime = REGIME_RANGING
+if isCompression and math.abs(trendScore) < 0.5
+    regime := REGIME_COMPRESSION
+else if isExpansion and math.abs(trendScore) >= 0.4
+    regime := REGIME_EXPANSION
+else if math.abs(trendScore) >= 0.4
+    regime := REGIME_TRENDING
+else
+    regime := REGIME_RANGING
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VWAP — Session Reset
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Detect new session (daily reset)
+isNewSession = ta.change(time("D")) != 0
+
+var float cumTPV = 0.0   // Cumulative Typical Price * Volume
+var float cumVol = 0.0   // Cumulative Volume
+var float cumTPV2 = 0.0  // For variance calculation
+
+if isNewSession
+    cumTPV  := 0.0
+    cumVol  := 0.0
+    cumTPV2 := 0.0
+
+float typicalPrice = hlc3
+cumTPV  += typicalPrice * volume
+cumVol  += volume
+cumTPV2 += typicalPrice * typicalPrice * volume
+
+float vwapValue = cumVol > 0 ? cumTPV / cumVol : close
+float vwapVariance = cumVol > 0 ? (cumTPV2 / cumVol) - (vwapValue * vwapValue) : 0.0
+float vwapStdDev = math.sqrt(math.max(0, vwapVariance))
+
+float vwapUpper1 = vwapValue + vwapStdDev
+float vwapLower1 = vwapValue - vwapStdDev
+float vwapUpper2 = vwapValue + 2 * vwapStdDev
+float vwapLower2 = vwapValue - 2 * vwapStdDev
+
+// Plot VWAP
+plot(i_showVWAP ? vwapValue : na, "VWAP", color.purple, 2)
+plot(i_showVWAP and i_vwapBands ? vwapUpper1 : na, "VWAP +1σ", color.new(color.purple, 60), 1)
+plot(i_showVWAP and i_vwapBands ? vwapLower1 : na, "VWAP -1σ", color.new(color.purple, 60), 1)
+plot(i_showVWAP and i_vwapBands ? vwapUpper2 : na, "VWAP +2σ", color.new(color.purple, 80), 1, plot.style_circles)
+plot(i_showVWAP and i_vwapBands ? vwapLower2 : na, "VWAP -2σ", color.new(color.purple, 80), 1, plot.style_circles)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUPPORT & RESISTANCE — Confluence Levels
+// ══════════════════════════════════════════════════════════════════════════════
+
+var array<Level> srLevels = array.new<Level>()
+
+// Collect candidate levels from swings
+f_collectSRLevels() =>
+    array.clear(srLevels)
+    
+    // Add recent swing levels
+    int swSz = array.size(swings)
+    if swSz > 0
+        for i = math.max(0, swSz - 20) to swSz - 1
+            Swing sw = array.get(swings, i)
+            Level newLvl = Level.new(sw.price, sw.isHigh ? "SWING_HIGH" : "SWING_LOW", sw.strength, sw.idx, na)
+            array.push(srLevels, newLvl)
+    
+    // Add VWAP as a level
+    Level vwapLvl = Level.new(vwapValue, "VWAP", 0.8, bar_index, na)
+    array.push(srLevels, vwapLvl)
+    
+    // Add round numbers near price
+    float roundBase = math.pow(10, math.floor(math.log10(close)) - 1)
+    float nearestRound = math.round(close / roundBase) * roundBase
+    Level roundLvl = Level.new(nearestRound, "ROUND", 0.4, bar_index, na)
+    array.push(srLevels, roundLvl)
+
+// Cluster and rank levels
+f_clusterSRLevels() =>
+    float tolerance = i_srClusterTol * atrVal
+    array<Level> clustered = array.new<Level>()
+    
+    // Simple clustering: group levels within tolerance
+    int sz = array.size(srLevels)
+    array<bool> used = array.new<bool>(sz, false)
+    
+    for i = 0 to sz - 1
+        if not array.get(used, i)
+            Level base = array.get(srLevels, i)
+            float sumPrice = base.price
+            float sumStrength = base.strength
+            int count = 1
+            
+            for j = i + 1 to sz - 1
+                if not array.get(used, j)
+                    Level cmp = array.get(srLevels, j)
+                    if math.abs(cmp.price - base.price) <= tolerance
+                        sumPrice += cmp.price
+                        sumStrength += cmp.strength
+                        count += 1
+                        array.set(used, j, true)
+            
+            float avgPrice = sumPrice / count
+            float totalStrength = math.min(1.0, sumStrength)
+            Level clusteredLvl = Level.new(avgPrice, "CLUSTER", totalStrength, bar_index, na)
+            array.push(clustered, clusteredLvl)
+            array.set(used, i, true)
+    
+    clustered
+
+// Update S/R levels periodically
+var array<Level> displayedSRLevels = array.new<Level>()
+var int lastSRUpdate = 0
+
+if bar_index - lastSRUpdate >= 20 or barstate.islast
+    f_collectSRLevels()
+    displayedSRLevels := f_clusterSRLevels()
+    lastSRUpdate := bar_index
+    
+    // Sort by distance from price and limit
+    // (Pine doesn't have easy sort, so we just take first N)
+    if array.size(displayedSRLevels) > i_maxLevels
+        while array.size(displayedSRLevels) > i_maxLevels
+            array.pop(displayedSRLevels)
+
+// Draw S/R levels
+if i_showSR and barstate.islast
+    int srSz = array.size(displayedSRLevels)
+    for i = 0 to srSz - 1
+        Level lvl = array.get(displayedSRLevels, i)
+        if na(lvl.lineObj)
+            lineColor = lvl.price > close ? i_bearColor : i_bullColor
+            lvl.lineObj := line.new(bar_index - 50, lvl.price, bar_index + 20, lvl.price, xloc.bar_index, extend.right, lineColor, line.style_solid, 1)
+            array.set(displayedSRLevels, i, lvl)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUAL OUTPUT
+// ══════════════════════════════════════════════════════════════════════════════
+
+// EMAs
+plot(i_showEMA ? emaFast : na, "EMA Fast", color.new(i_bullColor, 50), 1)
+plot(i_showEMA ? emaMid : na, "EMA Mid", color.new(color.yellow, 50), 1)
+plot(i_showEMA ? emaSlow : na, "EMA Slow", color.new(i_bearColor, 50), 1)
+
+// Trend background
+trendBgColor = trendDirection == TREND_UP ? color.new(i_bullColor, 95) : trendDirection == TREND_DOWN ? color.new(i_bearColor, 95) : na
+bgcolor(i_showTrend ? trendBgColor : na, title="Trend Background")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INFO TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80), frame_color=color.gray, frame_width=1, border_color=color.gray, border_width=1)
+
+if barstate.islast and i_showRegime
+    // Trend
+    trendColor = trendDirection == TREND_UP ? i_bullColor : trendDirection == TREND_DOWN ? i_bearColor : i_neutralColor
+    table.cell(infoTable, 0, 0, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, trendDirection + " (" + str.tostring(trendScore, "#.##") + ")", text_color=trendColor, text_size=size.small)
+    
+    // Regime
+    regimeColor = regime == REGIME_TRENDING or regime == REGIME_EXPANSION ? i_bullColor : regime == REGIME_COMPRESSION ? i_bearColor : i_neutralColor
+    table.cell(infoTable, 0, 1, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, regime, text_color=regimeColor, text_size=size.small)
+    
+    // Structure
+    structColor = currentTrend == TREND_UP ? i_bullColor : currentTrend == TREND_DOWN ? i_bearColor : i_neutralColor
+    table.cell(infoTable, 0, 2, "Structure", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, currentTrend, text_color=structColor, text_size=size.small)
+    
+    // Last Event
+    eventColor = lastEvent == EVENT_BOS_UP or lastEvent == EVENT_CHOCH_UP ? i_bullColor : lastEvent == EVENT_BOS_DOWN or lastEvent == EVENT_CHOCH_DN ? i_bearColor : i_neutralColor
+    table.cell(infoTable, 0, 3, "Last Event", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, lastEvent, text_color=eventColor, text_size=size.small)
+    
+    // VWAP Position
+    vwapPos = close > vwapValue ? "Above" : "Below"
+    vwapPosColor = close > vwapValue ? i_bullColor : i_bearColor
+    table.cell(infoTable, 0, 4, "VWAP", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, vwapPos + " (" + str.tostring(vwapValue, "#.##") + ")", text_color=vwapPosColor, text_size=size.small)
+    
+    // ATR
+    table.cell(infoTable, 0, 5, "ATR", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 5, str.tostring(atrVal, "#.####"), text_color=color.white, text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// BOS Alerts
+alertcondition(bosUpCondition, title="BOS Up", message="Break of Structure UP detected")
+alertcondition(bosDnCondition, title="BOS Down", message="Break of Structure DOWN detected")
+
+// CHoCH Alerts
+alertcondition(chochUpCondition, title="CHoCH Up", message="Change of Character UP (bullish reversal)")
+alertcondition(chochDnCondition, title="CHoCH Down", message="Change of Character DOWN (bearish reversal)")
+
+// Sweep Alerts
+alertcondition(bullSweepDetected, title="Bullish Sweep", message="Liquidity sweep with bullish reaction")
+alertcondition(bearSweepDetected, title="Bearish Sweep", message="Liquidity sweep with bearish reaction")
+
+// Regime Change
+regimeChanged = regime != regime[1]
+alertcondition(regimeChanged, title="Regime Change", message="Market regime changed")
