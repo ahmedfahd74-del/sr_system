@@ -41,7 +41,6 @@ analysis / sharing, but not for daily trading.
 indicator works on any symbol. Switch from AMD to BTCUSDT.P to SOLUSDT.P
 and it auto-detects fresh levels every time.
 
-<<<<<<< HEAD
 ### `institutional_engine_v6.pine`  *(full market-structure engine)*
 
 Complete Pine v6 port of the institutional trading engine: swing
