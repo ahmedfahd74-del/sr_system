@@ -41,6 +41,24 @@ analysis / sharing, but not for daily trading.
 indicator works on any symbol. Switch from AMD to BTCUSDT.P to SOLUSDT.P
 and it auto-detects fresh levels every time.
 
+### `institutional_engine_v6.pine`  *(full market-structure engine)*
+
+Complete Pine v6 port of the institutional trading engine: swing
+structure with BOS/CHoCH state machine, 11-sensor trend composite,
+W/D/4H/1H bias ladder, liquidity pools and sweeps, PDH-to-PMH levels
+with role reversal, volume profile (POC/VA/HVN/LVN), anchored VWAP,
+order blocks, fair value gaps, 9 entry setups, ATR-based stops,
+clustered profit targets, a 10-sensor A+++ trade score with hard
+rejects, and risk gates. No-lookahead by construction (pivots confirm
+k bars later, orders fill next-bar open); includes an on-chart
+explainability table showing which sensors drove each decision.
+
+**Usage**: paste into a blank Pine v6 indicator, add to chart, then
+tune the input group (swing legs, ATR length, score thresholds) to your
+instrument. See the header comment inside the file for the full engine
+mapping and caveats (delta is a signed-volume proxy; HTF bias is one
+period delayed).
+
 ## How to install
 
 1. Open TradingView.
