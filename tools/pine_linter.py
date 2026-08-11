@@ -97,6 +97,9 @@ class PineLinter:
         self._check_string_literals()
         self._check_indentation()
         self._check_deprecated_syntax()
+        self._scan_scopes()
+        self._check_function_global_reassignment()
+        self._check_request_security_expression()
         
         # Sort by line number
         self.issues.sort(key=lambda x: (x.line_num, x.column))
@@ -222,11 +225,15 @@ class PineLinter:
                     "Cannot use 'var' or 'varip' with tuple declarations",
                     "Remove var/varip keyword or use single variable")
             
-            # Check for curly braces (not valid in Pine)
-            if '{' in stripped and not stripped.startswith('//'):
+            # Check for curly braces (not valid in Pine).
+            # Strip comments and string literals first: alert message placeholders
+            # like {{ticker}} / {{interval}} are required by TradingView and are NOT
+            # code blocks. Only braces in real code are reported.
+            code_part = self._remove_strings(self._remove_comments(line))
+            if '{' in code_part:
                 # Exception: map literals use {}
-                if not re.search(r'map\.new<|=\s*\{', stripped):
-                    self._add_issue(i + 1, stripped.index('{') + 1, Severity.ERROR, "SYN001",
+                if not re.search(r'map\.new<|=\s*\{', code_part):
+                    self._add_issue(i + 1, code_part.index('{') + 1, Severity.ERROR, "SYN001",
                         "Curly braces {} are not used for code blocks in Pine Script",
                         "Use indentation for code blocks instead")
     
@@ -235,8 +242,11 @@ class PineLinter:
         # First pass: collect all declared variables
         declared = set()
         
-        assignment_pattern = re.compile(r'(\w+)\s*=\s*[^=]')
-        reassign_pattern = re.compile(r'(\w+)\s*:=')
+        # (?<![.\w]) skips UDT field writes like `ob.mitigated := true` or
+        # `lvl.lineObj := ...`, which are legal field mutations, not declarations.
+        # (The character class also rejects suffix matches like `itigated`.)
+        assignment_pattern = re.compile(r'(?<![.\w])(\w+)\s*=\s*[^=]')
+        reassign_pattern = re.compile(r'(?<![.\w])(\w+)\s*:=')
         
         for i, line in enumerate(self.lines):
             stripped = line.strip()
@@ -348,16 +358,20 @@ class PineLinter:
                         "Trailing comma before closing parenthesis",
                         "Remove trailing comma")
             
+            # Run operator checks on string-stripped code so that text inside
+            # string literals (e.g. "A+++ framework", "a+=b") is ignored.
+            code_part = self._remove_strings(self._remove_comments(line))
+            
             # Check for double operators (exclude valid Pine patterns)
             # Exclude: ==, !=, <=, >=, //, --, ++, **
-            double_op_match = re.search(r'(?<![=!<>])[+\-*/]{2,}(?![=*/])', stripped)
-            if double_op_match and '--' not in stripped and '//' not in stripped:
+            double_op_match = re.search(r'(?<![=!<>])[+\-*/]{2,}(?![=*/])', code_part)
+            if double_op_match and '--' not in code_part and '//' not in code_part:
                 self._add_issue(i + 1, 1, Severity.INFO, "OP002",
                     "Possible double operator detected (may be valid)",
                     "Check operator usage")
             
             # Check for missing space around operators (style)
-            if re.search(r'\w[+\-*/]=\w', stripped):
+            if re.search(r'\w[+\-*/]=\w', code_part):
                 self._add_issue(i + 1, 1, Severity.INFO, "STYLE001",
                     "Consider adding spaces around operators for readability",
                     "Example: x += 1 instead of x+=1")
@@ -420,6 +434,245 @@ class PineLinter:
                     self._add_issue(i + 1, line.index(old) + 1, Severity.WARNING, "DEP001",
                         msg, suggestion)
     
+    def _scan_scopes(self):
+        """Build scope maps used by the semantic checks.
+
+        - ``globals_decl``: name -> declaration line for every global (var or not)
+        - ``var_globals``: names declared with var/varip at global scope
+        - ``mutable_globals``: globals reassigned with := / += etc. anywhere
+          outside a function body (making them mutable, per Pine semantics)
+        - ``udf_names``: user-defined function names
+        - ``func_bodies``: name -> [(line_no, text)] body lines
+        - ``func_params``: name -> set of parameter names
+        """
+        self.globals_decl = {}
+        self.var_globals = set()
+        self.mutable_globals = set()
+        self.udf_names = set()
+        self.func_bodies = {}
+        self.func_params = {}
+        lines = self.lines
+
+        # Pass 1: global declarations + function definitions (indent-0 lines)
+        for i, line in enumerate(lines):
+            s = line.rstrip()
+            if not s.strip() or s.strip().startswith('//'):
+                continue
+            if len(s) - len(s.lstrip()) != 0:
+                continue
+            m = re.match(r'^(\w+)\s*\(([^)]*)\)\s*=>', s)
+            if m:
+                self.udf_names.add(m.group(1))
+                self.func_params[m.group(1)] = {
+                    p.strip().split()[-1] for p in m.group(2).split(',') if p.strip()
+                }
+                self.func_bodies[m.group(1)] = []
+                continue
+            m = re.match(
+                r'^(?:export\s+)?(?:var|varip)\s+(?:const\s+|simple\s+|series\s+)?'
+                r'(?:[\w.]+(?:<[^>]*>)?\s+)?(\w+)\s*=', s)
+            if m:
+                self.var_globals.add(m.group(1))
+                self.globals_decl.setdefault(m.group(1), i + 1)
+                continue
+            m = re.match(
+                r'^(?:const\s+|simple\s+|series\s+)?(?:[\w.]+(?:<[^>]*>)?\s+)?(\w+)\s*=', s)
+            if m and m.group(1) not in ('if', 'else', 'for', 'while', 'switch'):
+                self.globals_decl.setdefault(m.group(1), i + 1)
+
+        # Pass 2: fill function bodies; mark globals reassigned outside functions
+        # as mutable. In Pine, reassigning a global at global scope or inside
+        # if/for blocks is legal, but reassigning it inside a function is not
+        # (GLOB001) and mutable variables are banned from request.security
+        # expressions (SEC001).
+        cur_func = None
+        for i, line in enumerate(lines):
+            s = line.rstrip()
+            if not s.strip():
+                if cur_func is not None:
+                    self.func_bodies[cur_func].append((i + 1, s))
+                continue
+            indent = len(s) - len(s.lstrip())
+            if indent == 0:
+                m = re.match(r'^(\w+)\s*\([^)]*\)\s*=>', s)
+                cur_func = m.group(1) if m else None
+            if cur_func is not None:
+                self.func_bodies[cur_func].append((i + 1, s))
+                continue
+            m = re.match(r'^\s*([\w.]+)\s*(:=|\+=|-=|\*=|\/=)', s)
+            if m and '.' not in m.group(1) and m.group(1) in self.globals_decl:
+                self.mutable_globals.add(m.group(1))
+
+    def _check_function_global_reassignment(self):
+        """GLOB001: Pine cannot reassign a global variable from inside a
+        user-defined function (error: "Cannot modify global variable ...").
+        A local declaration inside the function shadows the global and is fine.
+        """
+        for fname, body in self.func_bodies.items():
+            locals_seen = set(self.func_params.get(fname, set()))
+            for ln, text in body:
+                s = text.strip()
+                if not s or s.startswith('//'):
+                    continue
+                # local declaration (with optional type prefix) shadows a global
+                m = re.match(
+                    r'^(?:const\s+|simple\s+|series\s+)?'
+                    r'(?:[\w.]+(?:<[^>]*>)?\s+)?(\w+)\s*=', s)
+                if m and not s.startswith('['):
+                    locals_seen.add(m.group(1))
+                m = re.match(r'^([\w.]+)\s*(:=|\+=|-=|\*=|\/=)', s)
+                if (m and '.' not in m.group(1)
+                        and m.group(1) in self.globals_decl
+                        and m.group(1) not in locals_seen):
+                    self._add_issue(ln, s.index(m.group(1)) + 1, Severity.ERROR,
+                        "GLOB001",
+                        f"Function '{fname}' reassigns global variable "
+                        f"'{m.group(1)}' (not allowed inside functions)",
+                        "Declare a local variable inside the function, or pass "
+                        "the value as a parameter, instead of reassigning the global")
+
+    def _extract_expression_arg(self, code, call_start):
+        """Best-effort extraction of the ``expression`` argument of a
+        ``request.security()`` call (3rd positional argument, or the named
+        ``expression =`` argument). Returns ``(expr_text, end_pos, line_num)``
+        or ``(None, 0, 0)`` when the argument cannot be determined."""
+        depth = 0
+        i = call_start
+        end = None
+        segs = []
+        seg_start = None
+        in_str = None
+        while i < len(code):
+            c = code[i]
+            if in_str:
+                if c == in_str and (i == 0 or code[i - 1] != '\\'):
+                    in_str = None
+                i += 1
+                continue
+            if c in '\"\'':
+                in_str = c
+                i += 1
+                continue
+            if c in '([{':
+                depth += 1
+                if depth == 1:
+                    seg_start = i + 1
+            elif c in ')]}':
+                if depth == 1:
+                    segs.append(code[seg_start:i])
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            elif c == ',' and depth == 1:
+                segs.append(code[seg_start:i])
+                seg_start = i + 1
+            i += 1
+        if depth != 0 or len(segs) < 2 or seg_start is None:
+            return None, end, 0
+        expr = None
+        for seg in segs[2:]:
+            nm = re.match(r'^\s*expression\s*=', seg)
+            if nm:
+                expr = seg[nm.end():].strip()
+                break
+        if expr is None and len(segs) >= 3 and not re.match(r'^\s*\w+\s*=', segs[2]):
+            expr = segs[2].strip()
+        if expr is None:
+            return None, end, 0
+        pos = code.find(expr, call_start)
+        expr_line = code[:pos].count('\n') + 1 if pos >= 0 else 1
+        return expr, end, expr_line
+
+    def _check_request_security_expression(self):
+        """SEC001/SEC002: Pine v6 restricts what a request.security() expression
+        may contain. It cannot contain mutable variables (var/varip declared, or
+        any global reassigned after initialization), nested request.*() calls,
+        chart-drawing functions, strategy.*() calls, or runtime.error().
+        User-defined functions are allowed, but their bodies are subject to the
+        same restrictions, so we scan them too.
+        """
+        banned = [
+            ('request.', 'nested request.*() call'),
+            ('plot(', 'chart-drawing call'),
+            ('plotshape(', 'chart-drawing call'),
+            ('plotchar(', 'chart-drawing call'),
+            ('plotcandle(', 'chart-drawing call'),
+            ('fill(', 'chart-drawing call'),
+            ('bgcolor(', 'chart-drawing call'),
+            ('barcolor(', 'chart-drawing call'),
+            ('alertcondition(', 'chart-drawing call'),
+            ('strategy.', 'strategy.*() call'),
+            ('label.', 'drawing call'),
+            ('line.', 'drawing call'),
+            ('box.', 'drawing call'),
+            ('table.', 'drawing call'),
+            ('runtime.error(', 'runtime.error() call'),
+            ('log.', 'log.*() call'),
+        ]
+        code = '\n'.join(self.lines)
+        for m in re.finditer(r'request\.security\s*\(', code):
+            expr, end, expr_line = self._extract_expression_arg(code, m.end() - 1)
+            if expr is None or expr_line == 0:
+                continue
+            for name in sorted(self.var_globals | self.mutable_globals):
+                if re.search(r'\b' + re.escape(name) + r'\b', expr):
+                    self._add_issue(expr_line, 1, Severity.ERROR, "SEC001",
+                        f"Mutable variable '{name}' used in request.security "
+                        f"expression (var-declared or reassigned variables are "
+                        f"not allowed here)",
+                        "Compute the value into a fresh, non-var variable before "
+                        "passing it to request.security")
+                    break
+            for tok, what in banned:
+                if tok in expr:
+                    self._add_issue(expr_line, expr.find(tok) + 1, Severity.ERROR,
+                        "SEC002", f"{what} not allowed inside request.security "
+                        f"expression",
+                        "Move the call outside the expression argument")
+                    break
+            for fname in sorted(self.udf_names):
+                if re.search(r'\b' + re.escape(fname) + r'\s*\(', expr):
+                    self._check_udf_for_expression(fname, expr_line, set())
+
+    def _check_udf_for_expression(self, fname, report_line, visited):
+        """Scan a user-defined function called from a request.security expression
+        for the same restrictions the expression itself must obey."""
+        if fname in visited:
+            return
+        visited.add(fname)
+        for ln, text in self.func_bodies.get(fname, []):
+            s = text.strip()
+            if not s or s.startswith('//'):
+                continue
+            for name in sorted(self.var_globals | self.mutable_globals):
+                if re.search(r'\b' + re.escape(name) + r'\b', s):
+                    self._add_issue(report_line, 1, Severity.ERROR, "SEC001",
+                        f"Mutable variable '{name}' referenced by '{fname}()' "
+                        f"inside a request.security expression",
+                        "Make the value non-var / non-reassigned, or compute it "
+                        "outside the expression")
+                    break
+            for tok, what in [
+                    ('request.', 'nested request.*() call'),
+                    ('plot(', 'chart-drawing call'),
+                    ('bgcolor(', 'chart-drawing call'),
+                    ('barcolor(', 'chart-drawing call'),
+                    ('alertcondition(', 'chart-drawing call'),
+                    ('strategy.', 'strategy.*() call'),
+                    ('runtime.error(', 'runtime.error() call'),
+                    ('log.', 'log.*() call')]:
+                if tok in s:
+                    self._add_issue(report_line, 1, Severity.ERROR, "SEC002",
+                        f"'{fname}()' contains {what}, which is not allowed inside "
+                        f"a request.security expression",
+                        "Move the call outside the function or the expression")
+                    return
+            for other in sorted(self.udf_names):
+                if other != fname and re.search(
+                        r'\b' + re.escape(other) + r'\s*\(', s):
+                    self._check_udf_for_expression(other, report_line, visited)
+
     def _remove_comments(self, line: str) -> str:
         """Remove comments from a line"""
         # Remove single-line comments
@@ -526,6 +779,45 @@ plot(close
 if true {
     x = 1
 }
+
+// OK: alert {{placeholders}} in strings must NOT trip SYN001
+alertcondition(close > open, title="Up", message="BOS on {{ticker}} ({{interval}}) @ {{close}}")
+
+// OK: UDT field mutation must NOT trip OP001
+type Zone
+    float top
+    float bottom
+    bool mitigated
+Zone z = Zone.new(0.0, 0.0, false)
+z.mitigated := true
+
+// OK: global reassignment inside if/for blocks at global scope is legal
+float gOk = 0.0
+if close > open
+    gOk := 1.0
+
+// Error GLOB001: function reassigns a global
+float gBad = 0.0
+badFn() =>
+    gBad := 1.0
+
+// OK: function-local shadowing a global name is legal
+float zLo = 0.0
+goodFn() =>
+    zLo = 0.0
+    zLo := 2.0
+
+// Error SEC001: var variable inside request.security expression
+var float vv = 0.0
+float req1 = request.security(syminfo.tickerid, "D", vv)
+
+// Error SEC002: drawing call inside request.security expression
+float req2 = request.security(syminfo.tickerid, "240", plot(close))
+
+// OK: pure user-defined function as expression is legal
+pureFn() =>
+    ta.ema(close, 20)
+float req3 = request.security(syminfo.tickerid, "240", pureFn())
 '''
         linter = PineLinter()
         issues = linter.lint(test_code)

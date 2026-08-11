@@ -35,16 +35,33 @@ Exit code: `0` if no errors (warnings allowed), `1` if errors or file not found.
 | IND001  | Tab characters (Pine prefers spaces)                        |
 | DEP001  | Deprecated syntax (`study(`, bare `security(`)              |
 | STYLE001| Missing spaces around operators                             |
+| GLOB001 | Function reassigns a global variable (banned in Pine)       |
+| SEC001  | Mutable/`var` variable used inside `request.security` expr  |
+| SEC002  | Drawing / `strategy.*` / `request.*` / `runtime.error` call |
+|         | inside a `request.security` expression                      |
 
-## Known false positives (by design — review, don't blindly fix)
+## Semantic checks (errors TradingView catches that syntax checks miss)
 
-- **`{{ticker}}` / `{{interval}}` alert placeholders** — the curly-brace
-  check (SYN001) flags `{{...}}` inside `alertcondition()` messages. These
-  are valid Pine placeholders; ignore those findings.
-- **UDT field mutations** — `ob.boxObj := ...` style writes on `type`
-  instances (with `array.set` write-back) can trigger OP001 because the
-  linter tracks plain variables, not user-defined-type fields.
+- **GLOB001 — global reassignment inside a function.** Pine raises "Cannot
+  modify global variable ..." when a user-defined function reassigns a
+  global (with `:=`, `+=`, etc.), even one declared with `var`. A local
+  declaration inside the function shadows the global and is *not* flagged.
+- **SEC001 / SEC002 — `request.security()` expression restrictions.** The
+  expression argument cannot contain mutable variables (anything declared
+  with `var`/`varip`, or any global reassigned after initialization),
+  nested `request.*()` calls, chart-drawing calls, or `strategy.*` /
+  `runtime.error()` calls. User-defined functions used as the expression
+  are scanned too, because their bodies must obey the same rules.
+
+## False positives handled
+
+- `{{ticker}}` / `{{interval}}` alert placeholders no longer trigger
+  SYN001 (string contents are stripped before the curly-brace check).
+- UDT field mutations (`ob.mitigated := ...`, `boxObj := ...` with
+  `array.set` write-back) no longer trigger OP001.
+- Operators inside string literals (e.g. `"A+++ framework"`) no longer
+  trigger OP002 / STYLE001.
 
 Pine still only compiles inside TradingView's editor — the linter catches
-the common structural errors but is not a substitute for a successful
-compile.
+the common structural and semantic errors but is not a substitute for a
+successful compile.
