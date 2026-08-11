@@ -59,6 +59,37 @@ instrument. See the header comment inside the file for the full engine
 mapping and caveats (delta is a signed-volume proxy; HTF bias is one
 period delayed).
 
+### `tip_v6.pine` — TIP Market Structure + Trend + Regime + Levels
+
+Research-mirror indicator (Pine v6) of the deterministic engines in the
+Trading Intelligence Platform: fractal swing detection, structure
+classification (HH/HL/LH/LL, BOS, CHoCH), a 6-vote trend engine, a
+precedence-based regime engine, and objective levels (PDH/PDL, PWH/PWL,
+PMH/PML, D/W/M opens, session hi/lo, session VWAP, rolling POC).
+
+**What it does**
+
+- `ta.pivothigh/low` k-bar-confirmed swing detection — everything shown
+  is causal (no repaint past bar confirmation).
+- Structure events: HH/HL/LH/LL labels, BOS and CHoCH markers, with
+  `lastBias` tracking to distinguish CHoCH (bias-flip) from BOS.
+- Trend: 6 independent votes (structure, EMA, momentum, VWAP, volume
+  participation + volatility shown direction-less) with agreement % —
+  no fused score.
+- Regime: deterministic precedence COMPRESSION → HIGH_VOL/LOW_VOL →
+  TRENDING_BULL/BEAR → RANGE, driven by ADX, BBW percentile and ATR
+  percentile, with a momentum guard so clean trends aren't labelled
+  compression.
+- Levels: prior-period extremes via `request.security` with
+  `lookahead_off` (strictly backward-looking), strength by proximity,
+  touch-count estimation, strength/touch filtering and a max-lines cap
+  (strongest first). Level table bottom-right, trend/regime panel
+  top-right, 4 `alertcondition`s (BOS/CHoCH up/down).
+
+**Install / use** — same steps as below; settings groups: Swing
+Detection, Market Structure, Trend Engine, Regime Engine, Objective
+Levels, Display.
+
 ## How to install
 
 1. Open TradingView.
