@@ -1,0 +1,488 @@
+//@version=6
+indicator("SWINGTECH V6", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=500)
+
+// ============================================================================
+// SWINGTECH V5 = V4 engine (untouched) + confluence layer
+//   V4 core: structure labels, BOS-defined leg, fib, FVG boxes
+//   Added:   liquidity sweep, fixed-range volume profile (POC) on the leg,
+//            daily HTF bias, full checklist
+// ============================================================================
+
+// ---------------- INPUTS ----------------
+gS = "Structure"
+pivLen     = input.int(4, "Swing strength", minval=1, group=gS, tooltip="Bars each side that define a confirmed swing.")
+showTri    = input.bool(true,  "Swing triangles", group=gS)
+showLbl    = input.bool(true,  "HH / HL / LH / LL labels", group=gS)
+eqTolATR   = input.float(0.15, "Equal high/low tolerance (× ATR)", minval=0.0, step=0.05, group=gS)
+
+gF = "Fib"
+showFib    = input.bool(true, "Show fib on latest BOS leg", group=gF)
+oteLevel   = input.float(0.71, "OTE level", minval=0.1, maxval=0.9, step=0.01, group=gF)
+fibExtend  = input.int(15, "Extend right (bars)", minval=0, maxval=200, group=gF)
+showBosLn  = input.bool(true, "Show BOS marker", group=gF)
+oteTol     = input.float(0.06, "OTE confluence tolerance (± fib ratio)", minval=0.0, maxval=0.5, step=0.01, group=gF, tooltip="How close an FVG or the POC must sit to the OTE level to count as lining up.")
+
+gV = "FVG"
+showFVG    = input.bool(true, "Show FVGs inside the leg", group=gV)
+fvgMinATR  = input.float(0.0, "Min FVG size (× ATR)", minval=0.0, step=0.1, group=gV)
+fvgWidth   = input.int(4, "FVG box width (bars)", minval=1, maxval=50, group=gV)
+
+gL = "Liquidity Sweep"
+showLS     = input.bool(true, "Mark liquidity sweep (if present)", group=gL, tooltip="Optional. Present when the leg's origin RAIDED a prior level — took it out with the wick and closed back inside. Never required, it just adds a check.")
+lsMode     = input.string("Standing level taken", "Sweep type", options=["Standing level taken", "Wick raid (strict close-back)"], group=gL, tooltip="Standing level taken (default): the origin's wick took out a level that was still standing, and the BOS itself proves the raid failed — price reversed and broke structure. Strict: additionally requires the sweep candle to close back inside the level. Use strict only if you want fewer, harder sweeps.")
+lsPivLen   = input.int(2, "Sweep level sensitivity", minval=1, maxval=5, group=gL, tooltip="Pivot strength used ONLY to find raidable levels — deliberately lighter than the triangle strength so sweeps of small unlabeled highs/lows are caught. Nothing extra is drawn on the chart. Lower = more levels considered.")
+lsLookback = input.int(120, "Sweep lookback (bars)", minval=10, maxval=400, group=gL, tooltip="How far back to look for the level the origin raided. Raise it to catch sweeps of levels from weeks ago.")
+lsMinPen   = input.float(0.0, "Min penetration (× ATR)", minval=0.0, step=0.05, group=gL, tooltip="How far past the level the wick must reach to count. 0 = any exceedance. Raise slightly to ignore sub-tick grazes.")
+
+gP = "Volume Profile"
+vpMode     = input.string("On", "Profile", options=["On", "Off"], group=gP)
+vpBins     = input.int(35, "Profile rows", minval=10, maxval=100, group=gP)
+vpLTF      = input.timeframe("15", "Intrabar timeframe", group=gP, tooltip="Volume is spread across each intrabar's range for accurate node placement, like TradingView's own FRVP.")
+vpWidth    = input.int(18, "Max profile width (bars)", minval=5, maxval=100, group=gP)
+vpOffset   = input.int(8, "Distance right of price (bars)", minval=0, maxval=100, group=gP)
+
+gH = "HTF Bias"
+biasTf     = input.timeframe("D", "Bias timeframe", group=gH)
+htfPiv     = input.int(3, "HTF swing strength", minval=2, group=gH)
+
+gC = "Colors"
+colStruct  = input.color(color.new(color.gray, 15),   "Structure labels", group=gC)
+colFibLn   = input.color(color.new(color.gray, 10),   "Fib 0 / 1", group=gC)
+colOte     = input.color(color.new(color.yellow, 25), "OTE line", group=gC)
+colBos     = input.color(color.new(color.gray, 30),   "BOS", group=gC)
+colFvgBox  = input.color(color.new(color.gray, 80),   "FVG box", group=gC)
+colLSc     = input.color(color.new(color.red, 20),    "Liquidity sweep", group=gC)
+colVP      = input.color(color.new(color.gray, 70),   "Profile", group=gC)
+colPOC     = input.color(color.new(color.orange, 20), "POC", group=gC)
+
+gK = "Checklist"
+showChk    = input.bool(true, "Show checklist", group=gK)
+
+atr = ta.atr(14)
+
+// intrabar data for the profile (global scope requirement)
+ltfH = request.security_lower_tf(syminfo.tickerid, vpLTF, high)
+ltfL = request.security_lower_tf(syminfo.tickerid, vpLTF, low)
+ltfV = request.security_lower_tf(syminfo.tickerid, vpLTF, volume)
+
+// ---------------- HTF BIAS (readout only) ----------------
+f_htfBias() =>
+    float hp = ta.pivothigh(high, htfPiv, htfPiv)
+    float lp = ta.pivotlow(low, htfPiv, htfPiv)
+    var float lH = na
+    var float pH = na
+    var float lL = na
+    var float pL = na
+    var int   hc = 0
+    var int   lc = 0
+    if not na(hp)
+        pH := lH
+        lH := hp
+        hc := na(pH) ? 0 : hp > pH ? 1 : -1
+    if not na(lp)
+        pL := lL
+        lL := lp
+        lc := na(pL) ? 0 : lp > pL ? 1 : -1
+    int b = hc == 1 and lc == 1 ? 1 : hc == -1 and lc == -1 ? -1 : 0
+    b
+
+htfBias = request.security(syminfo.tickerid, biasTf, f_htfBias(), lookahead=barmerge.lookahead_off)
+
+// ---------------- CONFIRMED SWINGS (V4 core) ----------------
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,  pivLen, pivLen)
+
+plotshape(showTri and not na(ph), "Swing High", shape.triangledown, location.abovebar, color.new(color.gray, 25), size=size.tiny, offset=-pivLen)
+plotshape(showTri and not na(pl), "Swing Low",  shape.triangleup,   location.belowbar, color.new(color.gray, 25), size=size.tiny, offset=-pivLen)
+
+var float lastPH    = na
+var int   lastPHbar = na
+var float prevPH    = na
+var int   prevPHbar = na
+var float lastPL    = na
+var int   lastPLbar = na
+var float prevPL    = na
+var int   prevPLbar = na
+var bool  phBroken  = false
+var bool  plBroken  = false
+var int   lastHiCls = 0
+var int   lastLoCls = 0
+
+if not na(ph)
+    prevPH    := lastPH
+    prevPHbar := lastPHbar
+    lastPH    := ph
+    lastPHbar := bar_index - pivLen
+    phBroken  := false
+    string t = "H"
+    if not na(prevPH)
+        if math.abs(ph - prevPH) <= eqTolATR * atr
+            t := "EQH"
+            lastHiCls := 0
+        else if ph > prevPH
+            t := "HH"
+            lastHiCls := 1
+        else
+            t := "LH"
+            lastHiCls := -1
+    if showLbl
+        label.new(lastPHbar, ph, t, xloc.bar_index, yloc.abovebar, color.new(color.black, 100), label.style_label_down, colStruct, size.tiny)
+
+if not na(pl)
+    prevPL    := lastPL
+    prevPLbar := lastPLbar
+    lastPL    := pl
+    lastPLbar := bar_index - pivLen
+    plBroken  := false
+    string t = "L"
+    if not na(prevPL)
+        if math.abs(pl - prevPL) <= eqTolATR * atr
+            t := "EQL"
+            lastLoCls := 0
+        else if pl < prevPL
+            t := "LL"
+            lastLoCls := -1
+        else
+            t := "HL"
+            lastLoCls := 1
+    if showLbl
+        label.new(lastPLbar, pl, t, xloc.bar_index, yloc.belowbar, color.new(color.black, 100), label.style_label_up, colStruct, size.tiny)
+
+// ---------------- BOS -> DEFINES THE LEG (V4 core, untouched) ----------------
+var int   legDir     = 0
+var float legAnchor  = na
+var int   legAnchorB = na
+var float legExt     = na
+var int   legExtB    = na
+var float bosLevel   = na
+var int   bosLevelB  = na
+var int   bosBreakB  = na
+var float lsLevel    = na
+var int   lsLevelB   = na
+
+bool newBos = false
+
+if not na(lastPL) and not plBroken and close < lastPL and not na(lastPH)
+    plBroken   := true
+    legDir     := -1
+    // Anchor = the true extreme between the last CONFIRMED swing high and the
+    // break bar. A high made after that pivot confirmed but before the BOS
+    // fired hasn't itself confirmed yet, so lastPH alone would anchor stale.
+    // Bounded window: the anchor can only move FORWARD to a more recent
+    // extreme, never back into older structure.
+    float aP = lastPH
+    int   aB = lastPHbar
+    int   aScan = math.min(bar_index - lastPHbar, 480)
+    for i = 0 to aScan
+        if high[i] > aP
+            aP := high[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPL
+    bosLevelB  := lastPLbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if not na(lastPH) and not phBroken and close > lastPH and not na(lastPL)
+    phBroken   := true
+    legDir     := 1
+    float aP = lastPL
+    int   aB = lastPLbar
+    int   aScan = math.min(bar_index - lastPLbar, 480)
+    for i = 0 to aScan
+        if low[i] < aP
+            aP := low[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPH
+    bosLevelB  := lastPHbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if newBos
+    int span = math.min(bar_index - legAnchorB, 480)
+    if legDir == -1
+        legExt  := low
+        legExtB := bar_index
+        for i = 0 to span
+            if low[i] < legExt
+                legExt  := low[i]
+                legExtB := bar_index - i
+    else
+        legExt  := high
+        legExtB := bar_index
+        for i = 0 to span
+            if high[i] > legExt
+                legExt  := high[i]
+                legExtB := bar_index - i
+
+    // ---- LIQUIDITY SWEEP (optional) ----
+    // Detection is DECOUPLED from the triangle system. Triangles stay sparse
+    // (pivLen) so the structure read stays clean, but sweeps are hunted against
+    // lighter "minor levels" (lsPivLen) — small highs/lows that never earned a
+    // label but still held liquidity. Nothing extra is drawn for them.
+    // A sweep = the origin's WICK exceeded such a level and price CLOSED back
+    // inside it (closes break, wicks sweep). First qualifying level walking
+    // BACK wins (most recent), search is bounded, so the marking can't wander.
+    lsLevel  := na
+    lsLevelB := na
+    if showLS
+        int   aOff   = math.max(0, bar_index - legAnchorB)
+        float aClose = close[aOff]
+        // runMax/runMin track the extreme of everything BETWEEN the candidate
+        // level and the origin. A level only counts if it was still STANDING
+        // when the origin raided it — if intervening price already traded
+        // through it, that liquidity was consumed and the level is dead.
+        float runMax = na
+        float runMin = na
+        for j = aOff + 1 to math.min(aOff + lsLookback, 450)
+            if na(high[j]) or j < lsPivLen
+                break
+            bool minorHi = true
+            bool minorLo = true
+            for w = 1 to lsPivLen
+                if na(high[j + w]) or na(high[j - w])
+                    minorHi := false
+                    minorLo := false
+                else
+                    if high[j] < high[j + w] or high[j] < high[j - w]
+                        minorHi := false
+                    if low[j] > low[j + w] or low[j] > low[j - w]
+                        minorLo := false
+            if legDir == -1 and minorHi
+                bool standing = na(runMax) or high[j] > runMax
+                bool took     = legAnchor > high[j] + lsMinPen * atr
+                bool failed   = lsMode == "Standing level taken" or aClose < high[j]
+                if standing and took and failed
+                    lsLevel  := high[j]
+                    lsLevelB := bar_index - j
+                    break
+            else if legDir == 1 and minorLo
+                bool standing = na(runMin) or low[j] < runMin
+                bool took     = legAnchor < low[j] - lsMinPen * atr
+                bool failed   = lsMode == "Standing level taken" or aClose > low[j]
+                if standing and took and failed
+                    lsLevel  := low[j]
+                    lsLevelB := bar_index - j
+                    break
+            runMax := na(runMax) ? high[j] : math.max(runMax, high[j])
+            runMin := na(runMin) ? low[j]  : math.min(runMin, low[j])
+
+if not newBos and legDir == -1 and not na(legExt) and low < legExt
+    legExt  := low
+    legExtB := bar_index
+if not newBos and legDir == 1 and not na(legExt) and high > legExt
+    legExt  := high
+    legExtB := bar_index
+
+// ---------------- DRAW ----------------
+var line  fl1   = na
+var line  fl0   = na
+var line  flOte = na
+var label lb1   = na
+var label lb0   = na
+var label lbOte = na
+var line  bosLn = na
+var label bosLb = na
+var line  lsLn  = na
+var label lsLb  = na
+var line  pocLn = na
+var array<box>   fvgB = array.new<box>()
+var array<label> fvgL = array.new<label>()
+var array<box>   vpB  = array.new<box>()
+
+// confluence results computed during draw, used by the checklist
+bool fvgAtOte = false
+var bool  pocAtOte = false
+var float pocRatio = na
+// The volume profile is expensive (leg bars × intrabars × bins). barstate.islast
+// is true on EVERY realtime tick, so recomputing it per tick grows with the leg
+// until it trips Pine's execution limit. Rebuild once per bar instead.
+var int lastVpBar = na
+bool vpRebuild = na(lastVpBar) or lastVpBar != bar_index
+
+if barstate.islast
+    line.delete(fl1)
+    line.delete(fl0)
+    line.delete(flOte)
+    label.delete(lb1)
+    label.delete(lb0)
+    label.delete(lbOte)
+    line.delete(bosLn)
+    label.delete(bosLb)
+    line.delete(lsLn)
+    label.delete(lsLb)
+    while array.size(fvgB) > 0
+        box.delete(array.pop(fvgB))
+    while array.size(fvgL) > 0
+        label.delete(array.pop(fvgL))
+
+    if legDir != 0 and not na(legAnchor) and not na(legExt)
+        int   xEnd = bar_index + fibExtend
+        float ote  = legExt + oteLevel * (legAnchor - legExt)
+        float oteA = legExt + (oteLevel - oteTol) * (legAnchor - legExt)
+        float oteB = legExt + (oteLevel + oteTol) * (legAnchor - legExt)
+        float zHi  = math.max(oteA, oteB)
+        float zLo  = math.min(oteA, oteB)
+
+        if showFib
+            fl1   := line.new(legAnchorB, legAnchor, xEnd, legAnchor, xloc.bar_index, color=colFibLn, width=1)
+            fl0   := line.new(legAnchorB, legExt,    xEnd, legExt,    xloc.bar_index, color=colFibLn, width=1)
+            flOte := line.new(legAnchorB, ote,       xEnd, ote,       xloc.bar_index, color=colOte,   width=1)
+            lb1   := label.new(xEnd, legAnchor, "1", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lb0   := label.new(xEnd, legExt,    "0", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lbOte := label.new(xEnd, ote, str.tostring(oteLevel), xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colOte, size.small)
+
+        if showBosLn and not na(bosLevel)
+            bosLn := line.new(bosLevelB, bosLevel, bosBreakB, bosLevel, xloc.bar_index, color=colBos, width=1)
+            bosLb := label.new(math.round(math.avg(bosLevelB, bosBreakB)), bosLevel, "BOS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_up : label.style_label_down, colBos, size.tiny)
+
+        // liquidity sweep (only when present)
+        if showLS and not na(lsLevel)
+            lsLn := line.new(lsLevelB, lsLevel, legAnchorB, lsLevel, xloc.bar_index, color=colLSc, width=1)
+            lsLb := label.new(math.round(math.avg(lsLevelB, legAnchorB)), lsLevel, "LS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_down : label.style_label_up, colLSc, size.tiny)
+
+        // FVGs inside the leg + OTE confluence test
+        int span = math.min(bar_index - legAnchorB, 400)
+        if span >= 2
+            for i = 0 to span - 2
+                if na(high[i + 2])
+                    break
+                float t = na
+                float b = na
+                if legDir == 1 and low[i] > high[i + 2] and (low[i] - high[i + 2]) >= fvgMinATR * atr
+                    t := low[i]
+                    b := high[i + 2]
+                else if legDir == -1 and high[i] < low[i + 2] and (low[i + 2] - high[i]) >= fvgMinATR * atr
+                    t := low[i + 2]
+                    b := high[i]
+                if not na(t)
+                    if b <= zHi and t >= zLo
+                        fvgAtOte := true
+                    if showFVG
+                        int bx = bar_index - i - 1
+                        array.push(fvgB, box.new(bx, t, bx + fvgWidth, b, xloc=xloc.bar_index, border_color=color.new(colFvgBox, 60), border_width=1, bgcolor=colFvgBox))
+                        array.push(fvgL, label.new(bx + fvgWidth, math.avg(t, b), "FVG", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, color.new(color.gray, 30), size.tiny))
+
+        // ---- FIXED RANGE VOLUME PROFILE over the leg ----
+        // Rebuilt once per bar, not per tick (see vpRebuild above).
+        if vpMode == "On" and span >= 3 and vpRebuild
+            lastVpBar := bar_index
+            line.delete(pocLn)
+            while array.size(vpB) > 0
+                box.delete(array.pop(vpB))
+            float minL = math.min(legAnchor, legExt)
+            float maxH = math.max(legAnchor, legExt)
+            for j = 0 to span
+                minL := math.min(minL, low[j])
+                maxH := math.max(maxH, high[j])
+            float binH = (maxH - minL) / vpBins
+            if binH > 0
+                array<float> vols = array.new<float>(vpBins, 0.0)
+                for j = 0 to span
+                    array<float> aH = ltfH[j]
+                    array<float> aL = ltfL[j]
+                    array<float> aV = ltfV[j]
+                    bool usedIntra = false
+                    if not na(aH) and array.size(aH) > 0 and array.size(aH) == array.size(aL) and array.size(aH) == array.size(aV)
+                        usedIntra := true
+                        for q = 0 to array.size(aH) - 1
+                            float ih = array.get(aH, q)
+                            float il = array.get(aL, q)
+                            float iv = nz(array.get(aV, q))
+                            if iv > 0 and not na(ih) and not na(il)
+                                float irng = ih - il
+                                if irng <= 0
+                                    int bi = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    array.set(vols, bi, array.get(vols, bi) + iv)
+                                else
+                                    int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((ih - minL) / binH))))
+                                    for b = b0 to b1
+                                        float lo = minL + b * binH
+                                        float hi = lo + binH
+                                        float ov = math.min(ih, hi) - math.max(il, lo)
+                                        if ov > 0
+                                            array.set(vols, b, array.get(vols, b) + iv * ov / irng)
+                    if not usedIntra
+                        float bl = low[j]
+                        float bh = high[j]
+                        float v  = nz(volume[j])
+                        float rg = bh - bl
+                        if v > 0
+                            if rg <= 0
+                                int bi = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                array.set(vols, bi, array.get(vols, bi) + v)
+                            else
+                                int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((bh - minL) / binH))))
+                                for b = b0 to b1
+                                    float lo = minL + b * binH
+                                    float hi = lo + binH
+                                    float ov = math.min(bh, hi) - math.max(bl, lo)
+                                    if ov > 0
+                                        array.set(vols, b, array.get(vols, b) + v * ov / rg)
+
+                float maxV = 0.0
+                int   maxI = -1
+                for b = 0 to vpBins - 1
+                    if array.get(vols, b) > maxV
+                        maxV := array.get(vols, b)
+                        maxI := b
+
+                if maxI >= 0 and maxV > 0
+                    float poc = minL + (maxI + 0.5) * binH
+                    pocRatio := (poc - legExt) / (legAnchor - legExt)
+                    pocAtOte := math.abs(pocRatio - oteLevel) <= oteTol
+                    int anchorR = bar_index + vpOffset + vpWidth
+                    for b = 0 to vpBins - 1
+                        float bv = array.get(vols, b)
+                        if bv > 0
+                            int w = math.max(1, math.round(vpWidth * bv / maxV))
+                            float lo = minL + b * binH
+                            array.push(vpB, box.new(anchorR - w, lo + binH, anchorR, lo, xloc=xloc.bar_index, border_color=color.new(colVP, 100), bgcolor=b == maxI ? color.new(colPOC, 45) : colVP))
+                    pocLn := line.new(legAnchorB, poc, anchorR, poc, xloc.bar_index, color=colPOC, style=line.style_dashed, width=1)
+
+// ---------------- CHECKLIST ----------------
+int structBias = lastHiCls == 1 and lastLoCls == 1 ? 1 : lastHiCls == -1 and lastLoCls == -1 ? -1 : 0
+
+var table t = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 25), border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast and showChk
+    color on  = color.new(color.lime, 0)
+    color off = color.new(color.gray, 45)
+    color txc = color.new(color.white, 10)
+
+    bool hasLeg   = legDir != 0
+    bool htfOk    = hasLeg and htfBias != 0 and ((legDir == 1) == (htfBias == 1))
+    bool bosFvgOk = hasLeg and fvgAtOte
+    bool lsOk     = hasLeg and not na(lsLevel)
+
+    int score = (htfOk ? 1 : 0) + (hasLeg ? 1 : 0) + (fvgAtOte ? 1 : 0) + (lsOk ? 1 : 0) + (pocAtOte ? 1 : 0)
+
+    string sTxt = structBias == 1 ? "BULLISH" : structBias == -1 ? "BEARISH" : "CONSOLIDATION"
+    color  sCol = structBias == 1 ? on : structBias == -1 ? color.new(color.red, 0) : color.new(color.orange, 0)
+    string hTxt = htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "—"
+
+    table.cell(t, 0, 0, "SETUP", text_color=txc, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 0, str.tostring(score) + "/5", text_color=score >= 4 ? on : txc, text_size=size.small)
+
+    table.cell(t, 0, 1, "Structure", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 1, sTxt, text_color=sCol, text_size=size.tiny)
+
+    table.cell(t, 0, 2, "HTF " + biasTf + " aligned", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 2, hTxt + " " + (htfOk ? "✓" : "—"), text_color=htfOk ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 3, "BOS + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 3, hasLeg ? "✓" : "—", text_color=hasLeg ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 4, str.tostring(oteLevel) + " + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 4, fvgAtOte ? "✓" : "—", text_color=fvgAtOte ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 5, "Liquidity sweep", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 5, lsOk ? "✓" : "—", text_color=lsOk ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 6, "POC @ " + str.tostring(oteLevel), text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    string pTxt = na(pocRatio) ? "—" : (pocAtOte ? "✓" : "—") + " (" + str.tostring(pocRatio, "#.##") + ")"
+    table.cell(t, 1, 6, pTxt, text_color=pocAtOte ? on : off, text_size=size.tiny)
