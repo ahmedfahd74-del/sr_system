@@ -98,7 +98,7 @@ showLegStats   = input.bool(true,  "Leg stats in table", group=gVP)
 gVPc = "Visual Pack Colors"
 colOteZone = input.color(color.yellow, "OTE zone band", group=gVPc)
 colLegBox  = input.color(color.blue,   "Leg box", group=gVPc)
-colAvwap   = input.color(color.cyan,   "Anchored VWAP", group=gVPc)
+colAvwap   = input.color(color.aqua,   "Anchored VWAP", group=gVPc)
 colVal     = input.color(color.orange, "Value area (VAH/VAL)", group=gVPc)
 colHtfBull = input.color(color.green,  "HTF bull", group=gVPc)
 colHtfBear = input.color(color.red,    "HTF bear", group=gVPc)
@@ -357,9 +357,7 @@ float avwap = avCumVol > 0 ? avCumTPV / avCumVol : na
 float avSd  = avCumVol > 0 ? math.sqrt(math.max(0.0, avCumTPV2 / avCumVol - avwap * avwap)) : na
 
 // ---- VISUAL PACK: background tints (HTF bias / session) + HTF badge ----
-color sessCol = hour(time, "UTC") >= 0 and hour(time, "UTC") < 8 ? color.new(colAsia, 93) :
-                hour(time, "UTC") >= 8 and hour(time, "UTC") < 13 ? color.new(colLondon, 93) :
-                hour(time, "UTC") >= 13 and hour(time, "UTC") < 21 ? color.new(colNY, 93) : na
+color sessCol = hour(time, "UTC") < 8 ? color.new(colAsia, 93) : hour(time, "UTC") < 13 ? color.new(colLondon, 93) : hour(time, "UTC") < 21 ? color.new(colNY, 93) : na
 color htfTintCol = htfBias == 1 ? color.new(colHtfBull, 86) : htfBias == -1 ? color.new(colHtfBear, 86) : na
 bgcolor(showSessTint and not na(sessCol) ? sessCol : showHtfTint and not na(htfTintCol) ? htfTintCol : na, title="Regime Tint")
 
