@@ -17,6 +17,12 @@ indicator("SWINGTECH V6", overlay=true, max_lines_count=500, max_labels_count=50
 //           - Fib extensions 1.272 / 1.618
 //           - FVG mitigation states, liquidity level right-extend
 //           - Checklist marks on chart, leg stats in table
+//   V6.3:   MTF consistency + Frozen HTF levels
+//           - All drawings anchored to wall-clock time (xloc.bar_time) so every
+//             level sits at the exact same point on 1W/1D/4H and all LTFs
+//           - Frozen HTF Levels: ALL BOS up/down, EQH, EQL and liquidity levels
+//             confirmed on 1W, 1D and 4H are drawn as persistent horizontal
+//             lines that appear at the same prices on 1H/30m/15m/5m
 // ============================================================================
 
 // ---------------- INPUTS ----------------
@@ -108,6 +114,26 @@ colAsia    = input.color(color.purple, "Asia session", group=gVPc)
 colLondon  = input.color(color.blue,   "London session", group=gVPc)
 colNY      = input.color(color.orange, "NY session", group=gVPc)
 
+gFz = "Frozen HTF Levels"
+showFz    = input.bool(true,  "Freeze HTF levels on all timeframes", group=gFz, tooltip="Computes BOS / EQH / EQL / liquidity levels on 1W, 1D and 4H and draws them as frozen horizontal lines at the same prices on whatever timeframe you are viewing (1H, 30m, 15m, 5m, ...).")
+fzTfW     = input.timeframe("W",   "Freeze TF 1 (highest)", group=gFz)
+fzTfD     = input.timeframe("D",   "Freeze TF 2", group=gFz)
+fzTf4     = input.timeframe("240", "Freeze TF 3", group=gFz)
+fzPiv     = input.int(3, "HTF swing strength", minval=1, maxval=10, group=gFz)
+fzTol     = input.float(0.15, "Equal high/low tolerance (×ATR)", minval=0.0, step=0.05, group=gFz)
+fzPen     = input.float(0.0, "Sweep min penetration (×ATR)", minval=0.0, step=0.05, group=gFz)
+fzMaxL    = input.int(120, "Max frozen levels", minval=20, maxval=400, group=gFz)
+showFzU   = input.bool(true, "BOS up levels", group=gFz)
+showFzD   = input.bool(true, "BOS down levels", group=gFz)
+showFzE   = input.bool(true, "EQH levels", group=gFz)
+showFzL   = input.bool(true, "EQL levels", group=gFz)
+showFzQ   = input.bool(true, "Liquidity levels", group=gFz)
+colFzU    = input.color(color.new(color.green, 35),  "BOS up color", group=gFz)
+colFzD    = input.color(color.new(color.red, 35),    "BOS down color", group=gFz)
+colFzE    = input.color(color.new(color.red, 20),    "EQH color", group=gFz)
+colFzL    = input.color(color.new(color.green, 20),  "EQL color", group=gFz)
+colFzQ    = input.color(color.new(color.orange, 25), "Liquidity color", group=gFz)
+
 atr = ta.atr(14)
 
 // MTF-consistent drawing helpers: anchor every object to wall-clock time
@@ -142,6 +168,88 @@ f_htfBias() =>
     b
 
 htfBias = request.security(syminfo.tickerid, biasTf, f_htfBias(), lookahead=barmerge.lookahead_off)
+
+// ---------------- FROZEN HTF LEVELS (BOS / EQH / EQL / LIQ) ----------------
+// Runs on each frozen TF and returns the levels confirmed on that HTF bar.
+// Emits only on the confirming bar (deduped via last-emitted vars), so the
+// caller draws one frozen line per level, not one per bar.
+f_htfLevels() =>
+    float hAtr = nz(ta.atr(14), 1)
+    float hp = ta.pivothigh(high, fzPiv, fzPiv)
+    float lp = ta.pivotlow(low, fzPiv, fzPiv)
+    var float lPH = na
+    var float pPH = na
+    var float lPL = na
+    var float pPL = na
+    var float lastEqh = na
+    var float lastEql = na
+    var float lastBosU = na
+    var float lastBosD = na
+    var float lastLiq = na
+    float outEqh = na
+    float outEql = na
+    float outBosU = na
+    float outBosD = na
+    float outLiq = na
+    if not na(hp)
+        pPH := lPH
+        lPH := hp
+        if not na(pPH) and math.abs(hp - pPH) <= fzTol * hAtr and hp != lastEqh
+            lastEqh := hp
+            outEqh := hp
+    if not na(lp)
+        pPL := lPL
+        lPL := lp
+        if not na(pPL) and math.abs(lp - pPL) <= fzTol * hAtr and lp != lastEql
+            lastEql := lp
+            outEql := lp
+    // BOS levels: a confirmed swing level that price has broken through
+    if not na(lPL) and close < lPL and lPL != lastBosD
+        lastBosD := lPL
+        outBosD := lPL
+    if not na(lPH) and close > lPH and lPH != lastBosU
+        lastBosU := lPH
+        outBosU := lPH
+    // Liquidity sweep: wick exceeded a prior swing level, close back inside
+    if not na(lPH) and high > lPH + fzPen * hAtr and close < lPH and lPH != lastLiq
+        lastLiq := lPH
+        outLiq := lPH
+    if not na(lPL) and low < lPL - fzPen * hAtr and close > lPL and lPL != lastLiq
+        lastLiq := lPL
+        outLiq := lPL
+    [outEqh, outEql, outBosU, outBosD, outLiq]
+
+fzMs(tf) => timeframe.in_seconds(tf) * 1000
+
+// frozen level storage (one shared capped array keeps us inside max_lines_count)
+var array<line> fzLines = array.new_line()
+
+f_freezeTF(tf, lvlE, lvlL, lvlU, lvlD, lvlQ) =>
+    bool nb = ta.change(time(tf)) != 0
+    if not nb or not showFz
+        return
+    int x0 = nz(time(tf)) - fzMs(tf)
+    if showFzE and not na(lvlE)
+        array.push(fzLines, line.new(x0, lvlE, time, lvlE, xloc.bar_time, color=colFzE, style=line.style_solid, width=1, extend=extend.right))
+    if showFzL and not na(lvlL)
+        array.push(fzLines, line.new(x0, lvlL, time, lvlL, xloc.bar_time, color=colFzL, style=line.style_solid, width=1, extend=extend.right))
+    if showFzU and not na(lvlU)
+        array.push(fzLines, line.new(x0, lvlU, time, lvlU, xloc.bar_time, color=colFzU, style=line.style_dashed, width=1, extend=extend.right))
+    if showFzD and not na(lvlD)
+        array.push(fzLines, line.new(x0, lvlD, time, lvlD, xloc.bar_time, color=colFzD, style=line.style_dashed, width=1, extend=extend.right))
+    if showFzQ and not na(lvlQ)
+        array.push(fzLines, line.new(x0, lvlQ, time, lvlQ, xloc.bar_time, color=colFzQ, style=line.style_dotted, width=1, extend=extend.right))
+    while array.size(fzLines) > fzMaxL
+        line.delete(array.shift(fzLines))
+
+// the three source timeframes, each with its own context (vars are per-call)
+[hEqhW, hEqlW, hBosUW, hBosDW, hLiqW] = request.security(syminfo.tickerid, fzTfW, f_htfLevels(), lookahead=barmerge.lookahead_off)
+[hEqhD, hEqlD, hBosUD, hBosDD, hLiqD] = request.security(syminfo.tickerid, fzTfD, f_htfLevels(), lookahead=barmerge.lookahead_off)
+[hEqh4, hEql4, hBosU4, hBosD4, hLiq4] = request.security(syminfo.tickerid, fzTf4, f_htfLevels(), lookahead=barmerge.lookahead_off)
+
+f_freezeTF(fzTfW, hEqhW, hEqlW, hBosUW, hBosDW, hLiqW)
+f_freezeTF(fzTfD, hEqhD, hEqlD, hBosUD, hBosDD, hLiqD)
+f_freezeTF(fzTf4, hEqh4, hEql4, hBosU4, hBosD4, hLiq4)
 
 // ---------------- CONFIRMED SWINGS (V4 core) ----------------
 ph = ta.pivothigh(high, pivLen, pivLen)
