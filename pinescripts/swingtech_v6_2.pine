@@ -110,6 +110,11 @@ colNY      = input.color(color.orange, "NY session", group=gVPc)
 
 atr = ta.atr(14)
 
+// MTF-consistent drawing helpers: anchor every object to wall-clock time
+// (xloc.bar_time) so levels sit at the exact same point on all timeframes.
+tfMs = timeframe.in_seconds() * 1000
+tAt(b) => time[math.max(0, bar_index - b)]
+
 // intrabar data for the profile (global scope requirement)
 ltfH = request.security_lower_tf(syminfo.tickerid, vpLTF, high)
 ltfL = request.security_lower_tf(syminfo.tickerid, vpLTF, low)
@@ -179,11 +184,11 @@ if not na(ph)
             t := "LH"
             lastHiCls := -1
     if showLbl
-        label.new(lastPHbar, ph, t, xloc.bar_index, yloc.abovebar, color.new(color.black, 100), label.style_label_down, colStruct, size.tiny)
+        label.new(tAt(lastPHbar), ph, t, xloc.bar_time, yloc.abovebar, color.new(color.black, 100), label.style_label_down, colStruct, size.tiny)
     if showEqhLn and t == "EQH"
         if not na(eqhLn)
             line.delete(eqhLn)
-        eqhLn := line.new(lastPHbar, ph, bar_index, ph, xloc.bar_index, extend=extend.right, color=colEqh, width=1)
+        eqhLn := line.new(tAt(lastPHbar), ph, time, ph, xloc.bar_time, extend=extend.right, color=colEqh, width=1)
 
 if not na(pl)
     prevPL    := lastPL
@@ -203,11 +208,11 @@ if not na(pl)
             t := "HL"
             lastLoCls := 1
     if showLbl
-        label.new(lastPLbar, pl, t, xloc.bar_index, yloc.belowbar, color.new(color.black, 100), label.style_label_up, colStruct, size.tiny)
+        label.new(tAt(lastPLbar), pl, t, xloc.bar_time, yloc.belowbar, color.new(color.black, 100), label.style_label_up, colStruct, size.tiny)
     if showEqlLn and t == "EQL"
         if not na(eqlLn)
             line.delete(eqlLn)
-        eqlLn := line.new(lastPLbar, pl, bar_index, pl, xloc.bar_index, extend=extend.right, color=colEql, width=1)
+        eqlLn := line.new(tAt(lastPLbar), pl, time, pl, xloc.bar_time, extend=extend.right, color=colEql, width=1)
 
 // ---------------- BOS -> DEFINES THE LEG (V4 core, untouched) ----------------
 var int   legDir     = 0
@@ -369,7 +374,7 @@ else if htfBias != lastHtfBadge or na(htfBadge)
     label.delete(htfBadge)
     lastHtfBadge := htfBias
     if htfBias != 0
-        htfBadge := label.new(bar_index, high, htfBias == 1 ? "HTF ▲ BULL" : "HTF ▼ BEAR", xloc.bar_index, yloc.abovebar, color.new(color.black, 100), label.style_label_right, htfBias == 1 ? colHtfBull : colHtfBear, size.tiny)
+        htfBadge := label.new(time, high, htfBias == 1 ? "HTF ▲ BULL" : "HTF ▼ BEAR", xloc.bar_time, yloc.abovebar, color.new(color.black, 100), label.style_label_right, htfBias == 1 ? colHtfBull : colHtfBear, size.tiny)
 
 // ---- VISUAL PACK: anchored VWAP plots ----
 plot(showAvwap and not na(avwap) ? avwap : na, "AVWAP @ leg origin", color=colAvwap, linewidth=1)
@@ -448,7 +453,8 @@ if barstate.islast
         label.delete(array.pop(fvgL))
 
     if legDir != 0 and not na(legAnchor) and not na(legExt)
-        int   xEnd = bar_index + fibExtend
+        int   xEndT = time + fibExtend * tfMs
+        int   aTime = tAt(legAnchorB)
         float ote  = legExt + oteLevel * (legAnchor - legExt)
         float oteA = legExt + (oteLevel - oteTol) * (legAnchor - legExt)
         float oteB = legExt + (oteLevel + oteTol) * (legAnchor - legExt)
@@ -456,44 +462,44 @@ if barstate.islast
         float zLo  = math.min(oteA, oteB)
 
         if showFib
-            fl1   := line.new(legAnchorB, legAnchor, xEnd, legAnchor, xloc.bar_index, color=colFibLn, width=1)
-            fl0   := line.new(legAnchorB, legExt,    xEnd, legExt,    xloc.bar_index, color=colFibLn, width=1)
-            flOte := line.new(legAnchorB, ote,       xEnd, ote,       xloc.bar_index, color=colOte,   width=1)
-            lb1   := label.new(xEnd, legAnchor, "1", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
-            lb0   := label.new(xEnd, legExt,    "0", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
-            lbOte := label.new(xEnd, ote, str.tostring(oteLevel), xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colOte, size.small)
+            fl1   := line.new(aTime, legAnchor, xEndT, legAnchor, xloc.bar_time, color=colFibLn, width=1)
+            fl0   := line.new(aTime, legExt,    xEndT, legExt,    xloc.bar_time, color=colFibLn, width=1)
+            flOte := line.new(aTime, ote,       xEndT, ote,       xloc.bar_time, color=colOte,   width=1)
+            lb1   := label.new(xEndT, legAnchor, "1", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lb0   := label.new(xEndT, legExt,    "0", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lbOte := label.new(xEndT, ote, str.tostring(oteLevel), xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_left, colOte, size.small)
 
         // ---- VISUAL PACK: OTE confluence zone band ----
         if showOteZone
             box.delete(oteZoneBox)
-            oteZoneBox := box.new(legAnchorB, zHi, xEnd + 120, zLo, xloc=xloc.bar_index, border_color=color.new(colOteZone, 55), border_width=1, bgcolor=color.new(colOteZone, 88))
+            oteZoneBox := box.new(aTime, zHi, xEndT + 120 * tfMs, zLo, xloc=xloc.bar_time, border_color=color.new(colOteZone, 55), border_width=1, bgcolor=color.new(colOteZone, 88))
 
         // ---- VISUAL PACK: leg box ----
         if showLegBox
             box.delete(legBox)
             float lBoxTop = math.max(legAnchor, legExt) + atr * 0.4
             float lBoxBot = math.min(legAnchor, legExt) - atr * 0.4
-            legBox := box.new(legAnchorB, lBoxTop, legExtB + 6, lBoxBot, xloc=xloc.bar_index, border_color=color.new(colLegBox, 50), border_width=1, bgcolor=color.new(colLegBox, 90))
+            legBox := box.new(aTime, lBoxTop, tAt(legExtB) + 6 * tfMs, lBoxBot, xloc=xloc.bar_time, border_color=color.new(colLegBox, 50), border_width=1, bgcolor=color.new(colLegBox, 90))
 
         // ---- VISUAL PACK: fib extensions 1.272 / 1.618 ----
         if showFibExt
             float ext127 = legExt + 1.272 * (legExt - legAnchor)
             float ext161 = legExt + 1.618 * (legExt - legAnchor)
-            flE127 := line.new(legAnchorB, ext127, xEnd, ext127, xloc.bar_index, color=colFibLn, style=line.style_dotted, width=1)
-            flE161 := line.new(legAnchorB, ext161, xEnd, ext161, xloc.bar_index, color=colFibLn, style=line.style_dotted, width=1)
-            lbE127 := label.new(xEnd, ext127, "1.272", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.tiny)
-            lbE161 := label.new(xEnd, ext161, "1.618", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.tiny)
+            flE127 := line.new(aTime, ext127, xEndT, ext127, xloc.bar_time, color=colFibLn, style=line.style_dotted, width=1)
+            flE161 := line.new(aTime, ext161, xEndT, ext161, xloc.bar_time, color=colFibLn, style=line.style_dotted, width=1)
+            lbE127 := label.new(xEndT, ext127, "1.272", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.tiny)
+            lbE161 := label.new(xEndT, ext161, "1.618", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.tiny)
 
         if showBosLn and not na(bosLevel)
             color bosC = legDir == 1 ? colBosBull : legDir == -1 ? colBosBear : colBos
-            bosLn := line.new(bosLevelB, bosLevel, bosBreakB, bosLevel, xloc.bar_index, color=bosC, width=1, extend=showBosExt ? extend.right : extend.none)
+            bosLn := line.new(tAt(bosLevelB), bosLevel, tAt(bosBreakB), bosLevel, xloc.bar_time, color=bosC, width=1, extend=showBosExt ? extend.right : extend.none)
             if showBosLb
-                bosLb := label.new(math.round(math.avg(bosLevelB, bosBreakB)), bosLevel, "BOS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_up : label.style_label_down, bosC, size.tiny)
+                bosLb := label.new(math.avg(tAt(bosLevelB), tAt(bosBreakB)), bosLevel, "BOS", xloc.bar_time, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_up : label.style_label_down, bosC, size.tiny)
 
         // liquidity sweep (only when present)
         if showLS and not na(lsLevel)
-            lsLn := line.new(lsLevelB, lsLevel, legAnchorB, lsLevel, xloc.bar_index, color=colLSc, width=1, extend=showLsExtend ? extend.right : extend.none)
-            lsLb := label.new(math.round(math.avg(lsLevelB, legAnchorB)), lsLevel, "LS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_down : label.style_label_up, colLSc, size.tiny)
+            lsLn := line.new(tAt(lsLevelB), lsLevel, aTime, lsLevel, xloc.bar_time, color=colLSc, width=1, extend=showLsExtend ? extend.right : extend.none)
+            lsLb := label.new(math.avg(tAt(lsLevelB), aTime), lsLevel, "LS", xloc.bar_time, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_down : label.style_label_up, colLSc, size.tiny)
 
         // FVGs inside the leg + OTE confluence test
         int span = math.min(bar_index - legAnchorB, 400)
@@ -522,12 +528,12 @@ if barstate.islast
                                     mit := true
                                     break
                     if showFVG and not (fvgMitMode == "Hide mitigated" and mit)
-                        int bx = bar_index - i - 1
+                        int bxT = time[i + 1]
                         color fCol = mit ? color.new(color.gray, 85) : colFvgBox
                         color fBrd = mit ? color.new(color.gray, 80) : color.new(colFvgBox, 60)
-                        array.push(fvgB, box.new(bx, t, bx + fvgWidth, b, xloc=xloc.bar_index, border_color=fBrd, border_width=1, bgcolor=fCol))
+                        array.push(fvgB, box.new(bxT, t, bxT + fvgWidth * tfMs, b, xloc=xloc.bar_time, border_color=fBrd, border_width=1, bgcolor=fCol))
                         if not mit
-                            array.push(fvgL, label.new(bx + fvgWidth, math.avg(t, b), "FVG", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, color.new(color.gray, 30), size.tiny))
+                            array.push(fvgL, label.new(bxT + fvgWidth * tfMs, math.avg(t, b), "FVG", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_left, color.new(color.gray, 30), size.tiny))
 
         // ---- FIXED RANGE VOLUME PROFILE over the leg ----
         // Rebuilt once per bar, not per tick (see vpRebuild above).
@@ -600,14 +606,14 @@ if barstate.islast
                     legPoc := poc
                     pocRatio := (poc - legExt) / (legAnchor - legExt)
                     pocAtOte := math.abs(pocRatio - oteLevel) <= oteTol
-                    int anchorR = bar_index + vpOffset + vpWidth
+                    int anchorRT = time + (vpOffset + vpWidth) * tfMs
                     for b = 0 to vpBins - 1
                         float bv = array.get(vols, b)
                         if bv > 0
                             int w = math.max(1, math.round(vpWidth * bv / maxV))
                             float lo = minL + b * binH
-                            array.push(vpB, box.new(anchorR - w, lo + binH, anchorR, lo, xloc=xloc.bar_index, border_color=color.new(colVP, 100), bgcolor=b == maxI ? color.new(colPOC, 45) : colVP))
-                    pocLn := line.new(legAnchorB, poc, anchorR, poc, xloc.bar_index, color=colPOC, style=line.style_dashed, width=1)
+                            array.push(vpB, box.new(anchorRT - w * tfMs, lo + binH, anchorRT, lo, xloc=xloc.bar_time, border_color=color.new(colVP, 100), bgcolor=b == maxI ? color.new(colPOC, 45) : colVP))
+                    pocLn := line.new(aTime, poc, anchorRT, poc, xloc.bar_time, color=colPOC, style=line.style_dashed, width=1)
 
                     // ---- VISUAL PACK: value area (VAH / VAL) ----
                     if showValArea
@@ -634,18 +640,18 @@ if barstate.islast
                         line.delete(vahLn)
                         line.delete(valLn)
                         box.delete(vaBox)
-                        vahLn := line.new(legAnchorB, vah, anchorR, vah, xloc.bar_index, color=colVal, style=line.style_dashed, width=1)
-                        valLn := line.new(legAnchorB, val, anchorR, val, xloc.bar_index, color=colVal, style=line.style_dashed, width=1)
-                        vaBox := box.new(legAnchorB, vah, anchorR, val, xloc=xloc.bar_index, border_color=color.new(colVal, 100), bgcolor=color.new(colVal, 92))
+                        vahLn := line.new(aTime, vah, anchorRT, vah, xloc.bar_time, color=colVal, style=line.style_dashed, width=1)
+                        valLn := line.new(aTime, val, anchorRT, val, xloc.bar_time, color=colVal, style=line.style_dashed, width=1)
+                        vaBox := box.new(aTime, vah, anchorRT, val, xloc=xloc.bar_time, border_color=color.new(colVal, 100), bgcolor=color.new(colVal, 92))
 
         // ---- VISUAL PACK: checklist marks mapped onto the OTE zone ----
         if showChkMap
             label.delete(chkFvg)
             label.delete(chkPoc)
             if fvgAtOte
-                chkFvg := label.new(xEnd + 3, ote + atr * 0.5, "FVG✓", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_down, colOte, size.tiny)
+                chkFvg := label.new(xEndT + 3 * tfMs, ote + atr * 0.5, "FVG✓", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_down, colOte, size.tiny)
             if pocAtOte and not na(legPoc)
-                chkPoc := label.new(xEnd + 5, ote - atr * 0.5, "POC✓", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_up, colPOC, size.tiny)
+                chkPoc := label.new(xEndT + 5 * tfMs, ote - atr * 0.5, "POC✓", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_up, colPOC, size.tiny)
 
 // ---------------- CHECKLIST ----------------
 int structBias = lastHiCls == 1 and lastLoCls == 1 ? 1 : lastHiCls == -1 and lastLoCls == -1 ? -1 : 0
@@ -689,7 +695,7 @@ if barstate.islast and showChk
     table.cell(t, 1, 5, lsOk ? "✓" : "—", text_color=lsOk ? on : off, text_size=size.tiny)
 
     table.cell(t, 0, 6, "POC @ OTE", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
-    string pTxt = na(pocRatio) ? "—" : (pocAtOte ? "✓ " : "") + "(" + str.tostring(pocRatio, "#.##") + ")"
+    string pTxt = na(pocRatio) ? "n/a" : (pocAtOte ? "✓ " : "") + "(" + str.tostring(pocRatio, "#.##") + ")"
     table.cell(t, 1, 6, pTxt, text_color=pocAtOte ? on : off, text_size=size.tiny)
 
     // ---- VISUAL PACK: leg stats ----
