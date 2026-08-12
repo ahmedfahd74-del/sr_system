@@ -59,6 +59,34 @@ instrument. See the header comment inside the file for the full engine
 mapping and caveats (delta is a signed-volume proxy; HTF bias is one
 period delayed).
 
+### `institutional_engine_v6_1.pine`  *(flagship + Visual Pack)*
+
+The `institutional_engine_v6.pine` engine with a toggle-gated Visual
+Pack layer (Settings → "11 · Visual Pack"): OTE/equilibrium band
+(VWAP ± 0.1 ATR), anchored VWAP at the last BOS/CHoCH with 1σ/2σ
+bands, HTF bias background tint + badge, and trend bar tint.
+
+This version also carries the verification-pass fixes, all confirmed
+against the TypeScript reference platform:
+
+- Role-reversal level scan uses `close[bar_index - j]` (index → offset)
+  — the retest setup was reading the wrong bars.
+- Stop loss attached to **all three** exit legs (was 20% only), so 100%
+  of the position is protected.
+- EMA sensor confirms direction only (`emaDir == 1 / -1`) — no flips.
+- Order-block displacement measured forward (causal), matching the
+  engine's "next 3 bars" rule.
+- Circuit-breaker pause (`cbPause`) is implemented in the entry gate.
+- Session windows use UTC (`hour(time, "UTC")`), matching the reference.
+- `EXECUTE_REDUCED` sizes at 0.75× risk; sizing accounts for
+  `syminfo.pointvalue`.
+- Visual Pack plots use `color.aqua` (valid built-in).
+
+Engine logic is otherwise byte-identical to `institutional_engine_v6.pine`.
+
+**Usage**: paste into the Pine editor (strategy), add to chart. Inputs
+match the base engine plus the Visual Pack group at the bottom.
+
 ### `tip_v6.pine` — TIP Market Structure + Trend + Regime + Levels
 
 Research-mirror indicator (Pine v6) of the deterministic engines in the
