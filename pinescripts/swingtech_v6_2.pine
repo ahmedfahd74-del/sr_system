@@ -226,21 +226,20 @@ var array<line> fzLines = array.new_line()
 
 f_freezeTF(tf, lvlE, lvlL, lvlU, lvlD, lvlQ) =>
     bool nb = ta.change(time(tf)) != 0
-    if not nb or not showFz
-        return
-    int x0 = nz(time(tf)) - fzMs(tf)
-    if showFzE and not na(lvlE)
-        array.push(fzLines, line.new(x0, lvlE, time, lvlE, xloc.bar_time, color=colFzE, style=line.style_solid, width=1, extend=extend.right))
-    if showFzL and not na(lvlL)
-        array.push(fzLines, line.new(x0, lvlL, time, lvlL, xloc.bar_time, color=colFzL, style=line.style_solid, width=1, extend=extend.right))
-    if showFzU and not na(lvlU)
-        array.push(fzLines, line.new(x0, lvlU, time, lvlU, xloc.bar_time, color=colFzU, style=line.style_dashed, width=1, extend=extend.right))
-    if showFzD and not na(lvlD)
-        array.push(fzLines, line.new(x0, lvlD, time, lvlD, xloc.bar_time, color=colFzD, style=line.style_dashed, width=1, extend=extend.right))
-    if showFzQ and not na(lvlQ)
-        array.push(fzLines, line.new(x0, lvlQ, time, lvlQ, xloc.bar_time, color=colFzQ, style=line.style_dotted, width=1, extend=extend.right))
-    while array.size(fzLines) > fzMaxL
-        line.delete(array.shift(fzLines))
+    if nb and showFz
+        int x0 = nz(time(tf)) - fzMs(tf)
+        if showFzE and not na(lvlE)
+            array.push(fzLines, line.new(x0, lvlE, time, lvlE, xloc.bar_time, color=colFzE, style=line.style_solid, width=1, extend=extend.right))
+        if showFzL and not na(lvlL)
+            array.push(fzLines, line.new(x0, lvlL, time, lvlL, xloc.bar_time, color=colFzL, style=line.style_solid, width=1, extend=extend.right))
+        if showFzU and not na(lvlU)
+            array.push(fzLines, line.new(x0, lvlU, time, lvlU, xloc.bar_time, color=colFzU, style=line.style_dashed, width=1, extend=extend.right))
+        if showFzD and not na(lvlD)
+            array.push(fzLines, line.new(x0, lvlD, time, lvlD, xloc.bar_time, color=colFzD, style=line.style_dashed, width=1, extend=extend.right))
+        if showFzQ and not na(lvlQ)
+            array.push(fzLines, line.new(x0, lvlQ, time, lvlQ, xloc.bar_time, color=colFzQ, style=line.style_dotted, width=1, extend=extend.right))
+        while array.size(fzLines) > fzMaxL
+            line.delete(array.shift(fzLines))
 
 // the three source timeframes, each with its own context (vars are per-call)
 [hEqhW, hEqlW, hBosUW, hBosDW, hLiqW] = request.security(syminfo.tickerid, fzTfW, f_htfLevels(), lookahead=barmerge.lookahead_off)
