@@ -516,10 +516,11 @@ if barstate.islast
                     bool mit = false
                     if fvgMitMode != "Show all"
                         int mMax = math.max(0, math.min(i - 1, 300))
-                        for m = 0 to mMax - 1
-                            if not na(low[m]) and not na(high[m]) and low[m] <= b and high[m] >= t
-                                mit := true
-                                break
+                        if mMax > 0
+                            for m = 0 to mMax - 1
+                                if not na(low[m]) and not na(high[m]) and low[m] <= b and high[m] >= t
+                                    mit := true
+                                    break
                     if showFVG and not (fvgMitMode == "Hide mitigated" and mit)
                         int bx = bar_index - i - 1
                         color fCol = mit ? color.new(color.gray, 85) : colFvgBox
