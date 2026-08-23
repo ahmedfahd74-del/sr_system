@@ -64,7 +64,7 @@ fvgMidExt  = input.int(0, "Mid line extra length (bars)", minval=0, maxval=200, 
 fvgMidExtM = input.string("None", "Mid line extend", options=["None","Right","Left","Both"], group=gV, tooltip="None = the 50% line spans only the box width (plus any extra bars above). Right = runs to the chart's right edge as a live reference. Left = runs back to the left edge. Both = full-width horizontal level across the whole chart.")
 
 gL = "Liquidity Sweep"
-showLS     = input.bool(true, "Mark liquidity sweep (if present)", group=gL, tooltip="Optional. Present when the leg's origin RAIDED a prior level — took it out with the wick and closed back inside. Never required, it just adds a check.")
+showLegSweep = input.bool(true, "Mark liquidity sweep (if present)", group=gL, tooltip="Optional. Present when the leg's origin RAIDED a prior level — took it out with the wick and closed back inside. Never required, it just adds a check.")
 lsMode     = input.string("Standing level taken", "Sweep type", options=["Standing level taken", "Wick raid (strict close-back)"], group=gL, tooltip="Standing level taken (default): the origin's wick took out a level that was still standing, and the BOS itself proves the raid failed — price reversed and broke structure. Strict: additionally requires the sweep candle to close back inside the level. Use strict only if you want fewer, harder sweeps.")
 lsPivLen   = input.int(2, "Sweep level sensitivity", minval=1, maxval=5, group=gL, tooltip="Pivot strength used ONLY to find raidable levels — deliberately lighter than the triangle strength so sweeps of small unlabeled highs/lows are caught. Nothing extra is drawn on the chart. Lower = more levels considered.")
 lsLookback = input.int(120, "Sweep lookback (bars)", minval=10, maxval=400, group=gL, tooltip="How far back to look for the level the origin raided. Raise it to catch sweeps of levels from weeks ago.")
@@ -113,7 +113,7 @@ useTf30  = input.bool(true, "Detect on 30m", group=gMT)
 useTf15  = input.bool(true, "Detect on 15m", group=gMT)
 useTf5   = input.bool(true, "Detect on 5m", group=gMT)
 showBos  = input.bool(true, "Show BOS lines",        group=gMT)
-showLs   = input.bool(true, "Show LIQ (sweep) lines", group=gMT)
+showPoolSweep = input.bool(true, "Show LIQ (sweep) lines", group=gMT)
 showEqh  = input.bool(true, "Show EQH lines",         group=gMT)
 showEql  = input.bool(true, "Show EQL lines",         group=gMT)
 localInPool   = input.bool(true, "Include THIS chart's own levels (tag: LOC)", group=gMT, tooltip="Feeds the chart timeframe's own BOS / LS / EQH / EQL / FVG into the same pool as the MTF levels, so confluence and focus can rank them alongside everything else. Their authority weight matches the chart's timeframe.")
@@ -373,28 +373,28 @@ htfBias = request.security(syminfo.tickerid, biasTf, f_htfBias(), lookahead=barm
 // ═══════════════════════════════════════════════════════════════════════════
 // PHASE 15 · ONE FVG TRUTH SOURCE
 // ═══════════════════════════════════════════════════════════════════════════
-// The rule lives here ONCE. Both publishers — the per-source packet and the
-// chart-timeframe LOC path — call it, so a three-candle gap means exactly the
-// same thing everywhere and the two cannot drift apart with a threshold change.
+// The rule lives here ONCE. The per-source packet, chart-timeframe LOC path and
+// chart-leg diagnostic all call it, so a three-candle gap means exactly the
+// same thing everywhere and cannot drift with a threshold change.
 //
 // Returns [bullMid, bullTop, bullBot, bearMid, bearTop, bearBot]; na where no
 // gap formed on this bar. The caller decides what to latch and how to publish;
 // the DEFINITION is not the caller's business.
-f_fvgRaw(float _atrv) =>
+f_fvgRaw(float _atrv, int _off) =>
     float _bM = na
     float _bT = na
     float _bB = na
     float _sM = na
     float _sT = na
     float _sB = na
-    if not na(high[2]) and low > high[2] and (low - high[2]) >= fvgMinATR * _atrv
-        _bM := math.avg(low, high[2])
-        _bT := low
-        _bB := high[2]
-    if not na(low[2]) and high < low[2] and (low[2] - high) >= fvgMinATR * _atrv
-        _sM := math.avg(low[2], high)
-        _sT := low[2]
-        _sB := high
+    if not na(high[_off + 2]) and low[_off] > high[_off + 2] and (low[_off] - high[_off + 2]) >= fvgMinATR * _atrv
+        _bM := math.avg(low[_off], high[_off + 2])
+        _bT := low[_off]
+        _bB := high[_off + 2]
+    if not na(low[_off + 2]) and high[_off] < low[_off + 2] and (low[_off + 2] - high[_off]) >= fvgMinATR * _atrv
+        _sM := math.avg(low[_off + 2], high[_off])
+        _sT := low[_off + 2]
+        _sB := high[_off]
     [_bM, _bT, _bB, _sM, _sT, _sB]
 
 f_stEvents() =>
@@ -594,7 +594,7 @@ f_fvgMids() =>
     // PHASE 1: confirmed-source only — a developing source bar must not publish
     bool _fvgConfirmed = barstate.isconfirmed
     // PHASE 15: the shared rule, not a local copy of it
-    [_rbM, _rbT, _rbB, _rsM, _rsT, _rsB] = f_fvgRaw(_atrF)
+    [_rbM, _rbT, _rbB, _rsM, _rsT, _rsB] = f_fvgRaw(_atrF, 0)
     if _fvgConfirmed and not na(_rbM)
         _bullMid := _rbM
         _bullTop := _rbT
@@ -1072,7 +1072,7 @@ f_mtfFvgStyle() =>
 // SOURCES the engine consults — evidence selection, a Brain input — and they
 // legitimately continue to gate ingest.
 f_lvlTypeVisible(string _typ) =>
-    _typ == "BOS" ? showBos : _typ == "LS" ? showLs : _typ == "EQH" ? showEqh : _typ == "EQL" ? showEql : _typ == "FVG+" ? (mtfFvgOn and mtfFvgBull) : _typ == "FVG-" ? (mtfFvgOn and mtfFvgBear) : true
+    _typ == "BOS" ? showBos : _typ == "LS" ? showPoolSweep : _typ == "EQH" ? showEqh : _typ == "EQL" ? showEql : _typ == "FVG+" ? (mtfFvgOn and mtfFvgBull) : _typ == "FVG-" ? (mtfFvgOn and mtfFvgBear) : true
 
 f_lvlStyle(string _typ) =>
     _typ == "FVG+" or _typ == "FVG-" ? f_mtfFvgStyle() : line.style_solid
@@ -1134,7 +1134,7 @@ f_ingest(string _src, float _bosPx, int _bosDir, float _eqh, float _eql, float _
     bool _new = _enabled and not na(_srcTime) and (na(_srcTime[1]) or _srcTime != _srcTime[1])
     if _enabled
         // ── D20 · REGISTRATION IS UNCONDITIONAL ───────────────────────────
-        // These six calls previously took showBos / showLs / showEqh / showEql
+        // These six calls previously took showBos / showPoolSweep / showEqh / showEql
         // and mtfFvgOn/mtfFvgBull/mtfFvgBear as their `_enabled` argument. Every
         // one of those is a DISPLAY control ("Show BOS lines", "Show bullish
         // FVG 50%"), so unchecking a box removed evidence from the registry and
@@ -1321,7 +1321,7 @@ if newBos
     // BACK wins (most recent), search is bounded, so the marking can't wander.
     lsLevel  := na
     lsLevelB := na
-    if showLS
+    if showLegSweep
         int   aOff   = math.max(0, bar_index - legAnchorB)
         float aClose = close[aOff]
         // runMax/runMin track the extreme of everything BETWEEN the candidate
@@ -1395,8 +1395,7 @@ var array<box>   vpB  = array.new<box>()
 // confluence results computed during draw, used by the checklist
 // PHASE 15: the original engine's leg-scan FVG check. It runs only on the last
 // bar and feeds the DIAGNOSTICS table alone — it has no authority and cannot
-// reach GO. Kept because the reading is informative; explicitly not a third
-// truth source for any decision.
+// reach GO. Its values come from f_fvgRaw(), the canonical gap definition.
 bool fvgAtOte = false
 var bool  pocAtOte = false
 var float pocRatio = na
@@ -1445,7 +1444,7 @@ if barstate.islast
             bosLb := label.new(math.round(math.avg(bosLevelB, bosBreakB)), bosLevel, "BOS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_up : label.style_label_down, colBos, size.tiny)
 
         // liquidity sweep (only when present)
-        if showLS and not na(lsLevel)
+        if showLegSweep and not na(lsLevel)
             lsLn := line.new(lsLevelB, lsLevel, legAnchorB, lsLevel, xloc.bar_index, color=colLSc, width=1)
             lsLb := label.new(math.round(math.avg(lsLevelB, legAnchorB)), lsLevel, "LS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_down : label.style_label_up, colLSc, size.tiny)
 
@@ -1455,14 +1454,9 @@ if barstate.islast
             for i = 0 to span - 2
                 if na(high[i + 2])
                     break
-                float t = na
-                float b = na
-                if legDir == 1 and low[i] > high[i + 2] and (low[i] - high[i + 2]) >= fvgMinATR * atr
-                    t := low[i]
-                    b := high[i + 2]
-                else if legDir == -1 and high[i] < low[i + 2] and (low[i + 2] - high[i]) >= fvgMinATR * atr
-                    t := low[i + 2]
-                    b := high[i]
+                [_legBullMid, _legBullTop, _legBullBot, _legBearMid, _legBearTop, _legBearBot] = f_fvgRaw(atr, i)
+                float t = legDir == 1 ? _legBullTop : legDir == -1 ? _legBearTop : na
+                float b = legDir == 1 ? _legBullBot : legDir == -1 ? _legBearBot : na
                 if not na(t)
                     if b <= zHi and t >= zLo
                         fvgAtOte := true
@@ -1566,11 +1560,9 @@ if barstate.islast
 //   D13 — the row labelled "BOS + FVG" displayed `hasLeg` alone. It never
 //         looked at the FVG at all, so it read ✓ on setups with no imbalance.
 //         `bosFvgOk` was computed correctly and then thrown away. Now used.
-//   D14 — `legDir` never resets to 0 after the first BOS, so `hasLeg` was
-//         permanently true and contributed a free point to every score from
-//         the first break onward. The row is dropped: a condition that is
-//         always true is not a condition, and the underlying variable is
-//         corrected in Phase 21 where the input contract is settled.
+//   D14 — `legDir` never resets to 0 after the first BOS. The former `hasLeg`
+//         intermediary added no information, so diagnostics now state their
+//         actual predicates directly rather than presenting it as evidence.
 //
 // The five-point score is GONE. It is replaced by the Decision Engine's own
 // state, shown as text so it cannot be mistaken for a competing tally.
@@ -1582,10 +1574,9 @@ if barstate.islast and showChk
     color off = color.new(color.gray, 45)
     color txc = color.new(color.white, 10)
 
-    bool hasLeg   = legDir != 0
-    bool htfOk    = hasLeg and htfBias != 0 and ((legDir == 1) == (htfBias == 1))
-    bool bosFvgOk = hasLeg and fvgAtOte
-    bool lsOk     = hasLeg and not na(lsLevel)
+    bool htfOk    = legDir != 0 and htfBias != 0 and ((legDir == 1) == (htfBias == 1))
+    bool bosFvgOk = legDir != 0 and fvgAtOte
+    bool lsOk     = not na(lsLevel)
 
     string sTxt = structBias == 1 ? "BULLISH" : structBias == -1 ? "BEARISH" : "CONSOLIDATION"
     color  sCol = structBias == 1 ? on : structBias == -1 ? color.new(color.red, 0) : color.new(color.orange, 0)
@@ -1629,15 +1620,16 @@ var float locFvgBearTop = na
 var float locFvgBearBot = na
 // PHASE 15: same shared rule as every other source — LOC is a source, not a
 // special case with its own definition of what a gap is
-[_lbM, _lbT, _lbB, _lsM2, _lsT2, _lsB2] = f_fvgRaw(atr)
-if not na(_lbM)
-    locFvgBull    := _lbM
-    locFvgBullTop := _lbT
-    locFvgBullBot := _lbB
-if not na(_lsM2)
-    locFvgBear    := _lsM2
-    locFvgBearTop := _lsT2
-    locFvgBearBot := _lsB2
+[_lbM, _lbT, _lbB, _lsM2, _lsT2, _lsB2] = f_fvgRaw(atr, 0)
+if barstate.isconfirmed
+    if not na(_lbM)
+        locFvgBull    := _lbM
+        locFvgBullTop := _lbT
+        locFvgBullBot := _lbB
+    if not na(_lsM2)
+        locFvgBear    := _lsM2
+        locFvgBearTop := _lsT2
+        locFvgBearBot := _lsB2
 
 // only draw a source TF when it is at least as large as the chart TF
 int   chartSec  = timeframe.in_seconds(timeframe.period)
@@ -1736,54 +1728,34 @@ plot(lifeLive, "Levels with authority", display = display.data_window)
 plot(array.size(levels) - lifeLive, "Levels dead (zero authority)", display = display.data_window)
 
 // ── PHASE 8 · PARITY DIAGNOSTICS ──────────────────────────────────────────
-// The plan's exit gate is a parity MATRIX, so the Data Window has to publish
-// per-source raw values that can be compared across charts by reading them off
-// rather than by eyeballing lines. Every number below is derived only from
-// source data, so each must be IDENTICAL on every chart timeframe where that
-// source is valid. Any difference is a parity failure by definition.
-f_regCount(string _src) =>
-    int _c = 0
-    if array.size(levels) > 0
-        for i = 0 to array.size(levels) - 1
-            Lvl _r = array.get(levels, i)
-            if _r.src == _src
-                _c += 1
-    _c
-
-f_regLive(string _src) =>
-    int _c = 0
-    if array.size(levels) > 0
-        for i = 0 to array.size(levels) - 1
-            Lvl _r = array.get(levels, i)
-            if _r.src == _src and f_lifeAuth(_r.typ, _r.life) > 0.0
-                _c += 1
-    _c
-
-// newest registered BOS price per source — the value the parity matrix compares
-f_regNewest(string _src, string _typ) =>
+// Compare event identity, price and lifecycle over the SAME loaded-history
+// interval. Raw registry counts are intentionally absent: chart timeframes load
+// different history depths, so their total historical membership need not match.
+f_regNewestState(string _src, string _typ) =>
     float _px = na
-    int   _b  = -1
+    int   _birthSrc = na
+    int   _life = na
     if array.size(levels) > 0
         for i = 0 to array.size(levels) - 1
             Lvl _r = array.get(levels, i)
-            if _r.src == _src and _r.typ == _typ and _r.birth > _b
-                _b  := _r.birth
-                _px := _r.px
-    _px
+            if _r.src == _src and _r.typ == _typ and (na(_birthSrc) or _r.birthSrc > _birthSrc)
+                _birthSrc := _r.birthSrc
+                _px       := _r.px
+                _life     := _r.life
+    [_px, _birthSrc, _life]
 
-plot(f_regNewest("W",  "BOS"), "PARITY W BOS px",  display = display.data_window)
-plot(f_regNewest("D",  "BOS"), "PARITY D BOS px",  display = display.data_window)
-plot(f_regNewest("4H", "BOS"), "PARITY 4H BOS px", display = display.data_window)
-plot(f_regNewest("1H", "BOS"), "PARITY 1H BOS px", display = display.data_window)
-plot(f_regNewest("30m","BOS"), "PARITY 30m BOS px", display = display.data_window)
-plot(f_regNewest("15m","BOS"), "PARITY 15m BOS px", display = display.data_window)
-plot(f_regNewest("5m", "BOS"), "PARITY 5m BOS px", display = display.data_window)
-plot(f_regCount("W"),  "PARITY W registry count",  display = display.data_window)
-plot(f_regLive("W"),   "PARITY W live count",      display = display.data_window)
-plot(f_regCount("D"),  "PARITY D registry count",  display = display.data_window)
-plot(f_regLive("D"),   "PARITY D live count",      display = display.data_window)
-plot(f_regCount("4H"), "PARITY 4H registry count", display = display.data_window)
-plot(f_regLive("4H"),  "PARITY 4H live count",     display = display.data_window)
+[_parityWPx, _parityWBirth, _parityWLife] = f_regNewestState("W", "BOS")
+[_parityDPx, _parityDBirth, _parityDLife] = f_regNewestState("D", "BOS")
+[_parity4HPx, _parity4HBirth, _parity4HLife] = f_regNewestState("4H", "BOS")
+plot(_parityWPx,    "PARITY W BOS px",         display = display.data_window)
+plot(_parityWBirth, "PARITY W BOS source time", display = display.data_window)
+plot(_parityWLife,  "PARITY W BOS state",      display = display.data_window)
+plot(_parityDPx,    "PARITY D BOS px",         display = display.data_window)
+plot(_parityDBirth, "PARITY D BOS source time", display = display.data_window)
+plot(_parityDLife,  "PARITY D BOS state",      display = display.data_window)
+plot(_parity4HPx,    "PARITY 4H BOS px",         display = display.data_window)
+plot(_parity4HBirth, "PARITY 4H BOS source time", display = display.data_window)
+plot(_parity4HLife,  "PARITY 4H BOS state",      display = display.data_window)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE DECISION ENGINE — PHASES 10, 11, 12
@@ -1835,9 +1807,9 @@ f_locEligible(int _i, int _dir) =>
     bool _dirOk = _dir == 1 ? _e.dir == "BULL" : _e.dir == "BEAR"
     _live and _side and _dirOk and f_tfWeight(_e.src) >= locMinW
 
-// Confluence score for one level, reusing the Phase 7 rules verbatim so the
-// engine and the chart cannot disagree about what a level is worth.
-f_locScore(int _i) =>
+// The one authoritative confluence resolver. Decision, chart decoration and
+// focus all consume this result; none may re-derive the numeric score.
+f_levelScore(int _i) =>
     Lvl _a = array.get(levels, _i)
     float _sc = f_tfWeight(_a.src) * f_lifeAuth(_a.typ, _a.life)
     string _seen = "|" + f_srcCanon(_a.src) + "|"
@@ -1846,7 +1818,8 @@ f_locScore(int _i) =>
         for j = 0 to array.size(levels) - 1
             if j != _i
                 Lvl _b = array.get(levels, j)
-                if math.abs(_b.px - _a.px) <= f_pairTol(_a.src, _b.src)
+                bool _typeOk = conflCrossType or _b.typ == _a.typ
+                if _typeOk and math.abs(_b.px - _a.px) <= f_pairTol(_a.src, _b.src)
                     if not f_dirCompat(_a.dir, _b.dir)
                         _conf := true
                     if f_dirCompat(_a.dir, _b.dir)
@@ -1856,6 +1829,8 @@ f_locScore(int _i) =>
                         _sc += _same ? 0.0 : f_tfWeight(_b.src) * (_dup ? conflSameTfMult : 1.0) * f_lifeAuth(_b.typ, _b.life)
                         if not _dup
                             _seen := _seen + _bc + "|"
+    if scFold
+        _sc := _sc * f_provenMult(_a.holds, _a.breaks)
     [_sc, _conf]
 
 // The published selection. Every field the plan names, one source of truth.
@@ -1900,7 +1875,7 @@ if macroDir != 0 and array.size(levels) > 0
         bool _ok = f_locEligible(i, macroDir)
         if _ok
             _cands += 1
-            [_sc, _cf] = f_locScore(i)
+            [_sc, _cf] = f_levelScore(i)
             float _d = math.abs(_c.px - close)
             bool _reach = _d <= locMaxDistATR * atr
             // A contested price is refused outright. Phase 7 could only
@@ -1920,7 +1895,7 @@ if macroDir != 0 and array.size(levels) > 0
                     array.push(locWhy, _c.src + " " + _c.typ + " — lower score (" + str.tostring(_sc, "#.#") + ")")
 if _best >= 0
     Lvl _w = array.get(levels, _best)
-    [_wsc, _wcf] = f_locScore(_best)
+    [_wsc, _wcf] = f_levelScore(_best)
     selId      := _w.id
     selPrice   := _w.px
     selSource  := _w.src
@@ -2054,7 +2029,8 @@ if execOn and barstate.islast and array.size(levels) > 0
         // execution mode must keep. Comparing against the literal string "LOC"
         // would blank the chart's own levels on exactly those timeframes.
         if f_srcCanon(_hs.src) != locCanon or not execKeepLocal
-            line.set_color(_hs.ln, color.new(color.white, 100))
+            if not na(_hs.ln)
+                line.set_color(_hs.ln, color.new(color.white, 100))
             if not na(_hs.lb)
                 label.delete(_hs.lb)
                 _hs.lb := na
@@ -2091,14 +2067,13 @@ if conflOn and not execOn and barstate.islast and array.size(levels) > 0
         bool    _primary  = true
         bool    _sameType = true
         bool    _corr     = false
-        bool    _conflict = false
+        [_score, _conflict] = f_levelScore(i)
         // PHASE 5: authority is gated by lifecycle. A level whose state says it
         // has been broken / swept / filled / retired contributes 0 — both as a
         // group member and as the group's own seed — so dead evidence cannot
         // reach the score threshold, the focus filter or the tag.
         float   _aAuth    = f_lifeAuth(_a.typ, _a.life)
         float   _selfAuth = f_tfWeight(_a.src) * _aAuth
-        float   _score    = _selfAuth
         for j = 0 to array.size(levels) - 1
             if j != i
                 Lvl _b = array.get(levels, j)
@@ -2113,7 +2088,6 @@ if conflOn and not execOn and barstate.islast and array.size(levels) > 0
                     // event seen twice: it contributes nothing extra. Same TF,
                     // DIFFERENT type is real but correlated, so it keeps the
                     // conflSameTfMult discount and flags the group as correlated.
-                    bool _sameEvent = _dupTf and _b.typ == _a.typ
                     // PHASE 7 component 4: DIRECTION COMPATIBILITY.
                     // An opposing level is the market disagreeing at this price.
                     // It contributes nothing — never negative, because the plan
@@ -2121,11 +2095,8 @@ if conflOn and not execOn and barstate.islast and array.size(levels) > 0
                     // marks the cluster CONFLICT so the disagreement is stated
                     // rather than silently averaged away.
                     bool _compat = f_dirCompat(_a.dir, _b.dir)
-                    if not _compat
-                        _conflict := true
                     if _compat
                         _nCompat += 1
-                        _score += _sameEvent ? 0.0 : f_tfWeight(_b.src) * (_dupTf ? conflSameTfMult : 1.0) * f_lifeAuth(_b.typ, _b.life)
                         if _dupTf
                             _corr := true
                         if not _dupTf
@@ -2145,9 +2116,6 @@ if conflOn and not execOn and barstate.islast and array.size(levels) > 0
                             _primary := false
                         if _oAuth == _selfAuth and j < i
                             _primary := false
-        // track record folds in as a multiplier when enabled
-        if scFold
-            _score := _score * f_provenMult(_a.holds, _a.breaks)
         // record suffix for the tag: (holds/tests), blank when never tested
         // PHASE 6: prospective counts accrued since birth, so an empty record
         // genuinely means "not tested yet" rather than "not found in the
@@ -2156,9 +2124,10 @@ if conflOn and not execOn and barstate.islast and array.size(levels) > 0
         // PHASE 7: decoration keys on COMPATIBLE agreement, not raw occupancy.
         // A level with three opposing neighbours is not a confluence cluster.
         if _nCompat > 1
-            line.set_width(_a.ln, conflW)
-            if conflUseCol
-                line.set_color(_a.ln, conflCol)
+            if not na(_a.ln)
+                line.set_width(_a.ln, conflW)
+                if conflUseCol
+                    line.set_color(_a.ln, conflCol)
             if conflMergeLbl and not na(_a.lb) and _primary
                 // "~" marks a group whose members are not fully independent:
                 // at least two share one canonical timeframe. The score already
@@ -2181,7 +2150,8 @@ if conflOn and not execOn and barstate.islast and array.size(levels) > 0
         // Line is made transparent rather than deleted so the slot stays intact
         // and the next bar's sync does not have to rebuild it.
         if conflMinScore > 0 and _score < conflMinScore
-            line.set_color(_a.ln, color.new(color.white, 100))
+            if not na(_a.ln)
+                line.set_color(_a.ln, color.new(color.white, 100))
             if not na(_a.lb)
                 label.delete(_a.lb)
                 _a.lb := na
@@ -2204,31 +2174,7 @@ if focusOn and not execOn and barstate.islast and array.size(levels) > 0
     // rank: re-derive each level's score, then keep the closest on each side
     for i = 0 to array.size(levels) - 1
         Lvl _s = array.get(levels, i)
-        // PHASE 5: same lifecycle gate as the confluence pass. The focus pass
-        // re-derives its own score, so it must apply the gate itself or a dead
-        // level could still be picked as one of the two focus lines.
-        float  _sc    = f_tfWeight(_s.src) * f_lifeAuth(_s.typ, _s.life)
-        // PHASE 4: canonical identity here too — this loop re-derives the score
-        // independently of the confluence pass, so it must dedupe identically
-        // or focus and confluence would disagree about the same level.
-        string _fseen = "|" + f_srcCanon(_s.src) + "|"
-        for j = 0 to array.size(levels) - 1
-            if j != i
-                Lvl _o = array.get(levels, j)
-                bool _tok = conflCrossType or _o.typ == _s.typ
-                // PHASE 7: identical rules to the confluence pass — source-
-                // normalized proximity and direction compatibility. If focus
-                // used a different definition of "agrees", the two views would
-                // rank the same level differently.
-                if _tok and math.abs(_o.px - _s.px) <= f_pairTol(_s.src, _o.src) and f_dirCompat(_s.dir, _o.dir)
-                    string _oCanon = f_srcCanon(_o.src)
-                    bool _fdup  = str.contains(_fseen, "|" + _oCanon + "|")
-                    bool _fSame = _fdup and _o.typ == _s.typ
-                    _sc += _fSame ? 0.0 : f_tfWeight(_o.src) * (_fdup ? conflSameTfMult : 1.0) * f_lifeAuth(_o.typ, _o.life)
-                    if not _fdup
-                        _fseen := _fseen + _oCanon + "|"
-        if scFold
-            _sc := _sc * f_provenMult(_s.holds, _s.breaks)
+        [_sc, _focusConflict] = f_levelScore(i)
         // ── PHASE 8 · THE FRESHNESS GATE IS GONE (D6) ────────────────────
         // Two gates now, not three: AUTHORITY (score) and REACH (distance).
         //
@@ -2276,7 +2222,8 @@ if focusOn and not execOn and barstate.islast and array.size(levels) > 0
             if math.abs(_s2.px - _kB.px) <= f_pairTol(_s2.src, _kB.src)
                 _keep := true
         if not _keep
-            line.set_color(_s2.ln, color.new(color.white, 100))
+            if not na(_s2.ln)
+                line.set_color(_s2.ln, color.new(color.white, 100))
             if not na(_s2.lb)
                 label.delete(_s2.lb)
                 _s2.lb := na
@@ -2528,9 +2475,18 @@ bool goShort = false
 // alone can no longer fire — that was the defect (D9), a score threshold
 // standing in for an entry sequence.
 bool goArmed = execOn and exLocked and exRRok and timeState == 5
-if goArmed and exDir == 1
+// ARMED is persistent setup state; GO is a one-shot event for that armed setup.
+// A temporary R:R failure may delay the event, but cannot re-arm an already
+// consumed setup until the timing state or lock resets.
+var bool goConsumed = false
+if barstate.isconfirmed and (not exLocked or timeState != 5)
+    goConsumed := false
+bool goFire = barstate.isconfirmed and goArmed and not goConsumed
+if goFire
+    goConsumed := true
+if goFire and exDir == 1
     goLong := true
-if goArmed and exDir == -1
+if goFire and exDir == -1
     goShort := true
 
 bool exReady = goLong or goShort
@@ -2538,8 +2494,8 @@ bool exLong  = goLong
 bool exShort = goShort
 
 // historical + live triggers (const sizes — plotshape demands them)
-plotshape(execOn and execMarks and exLong  and not exLong[1],  "Exec Long",  shape.triangleup,   location.belowbar, color.new(#26a69a, 0), size=size.small)
-plotshape(execOn and execMarks and exShort and not exShort[1], "Exec Short", shape.triangledown, location.abovebar, color.new(#ef5350, 0), size=size.small)
+plotshape(execOn and execMarks and exLong,  "Exec Long",  shape.triangleup,   location.belowbar, color.new(#26a69a, 0), size=size.small)
+plotshape(execOn and execMarks and exShort, "Exec Short", shape.triangledown, location.abovebar, color.new(#ef5350, 0), size=size.small)
 bgcolor(execOn and execTint and exReady ? color.new(exDir == 1 ? color.green : color.red, 90) : na, title="Execution Ready")
 
 var label exFlag = na
@@ -2580,8 +2536,8 @@ if execOn and execTable and barstate.islast
     table.cell(exT, 0, 9, "Stop / Target", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
     table.cell(exT, 1, 9, (na(exStop) ? "—" : str.tostring(exStop, format.mintick)) + " / " + (na(exTarget) ? "—" : str.tostring(exTarget, format.mintick)), text_color=_tx, text_size=size.tiny)
 
-alertcondition(exLong  and not exLong[1],  "EXEC LONG",  "SWINGTECH execution: all conditions met, long")
-alertcondition(exShort and not exShort[1], "EXEC SHORT", "SWINGTECH execution: all conditions met, short")
+alertcondition(exLong,  "EXEC LONG",  "SWINGTECH execution: all conditions met, long")
+alertcondition(exShort, "EXEC SHORT", "SWINGTECH execution: all conditions met, short")
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2638,6 +2594,8 @@ f_ckAction() =>
         _a := "WAIT · ARM"
     if lockState == 3 and timeState == 5 and not exRRok
         _a := "WAIT · RISK"
+    if lockState == 3 and timeState == 5 and exRRok
+        _a := "ARMED"
     if goLong
         _a := "GO LONG"
     if goShort
@@ -2806,7 +2764,7 @@ if trackOn and array.size(trE) > 0
 // ---- record new triggers (rising edge only: one move = one signal) ----
 // The tracker observes the SAME GO event the engine produces. It does not
 // recreate a signal of its own — that was one of the four brains.
-bool _trFire = (exLong and not exLong[1]) or (exShort and not exShort[1])
+bool _trFire = exLong or exShort
 bool _trFree = trAllowMulti or array.size(trE) == 0
 var int trTotal = 0
 if trackOn and _trFire and _trFree and (bar_index - trLastBar) >= trCooldown and not na(exStop) and not na(exTarget) and exRR > 0
