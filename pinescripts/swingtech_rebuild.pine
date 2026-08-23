@@ -1,0 +1,2870 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// SWINGTECH REBUILD — working file
+// Baseline: pinescripts/archive/SWINGTECH_CLAUDE_FROZEN.pine
+//   sha256   0cca3915ff71d096ac23e2b7b09d07299710204078f651c5c0b2a265bcbeaf4a
+//   git blob bc17db9647527584175ea4cb117ae68f61ac0bea
+//   1560 lines · 94573 bytes
+// Phase 0: header only. No logic differs from the frozen baseline.
+// Governed by SWINGTECH_REBUILD_PLAN.md — phase loop, no skipping, no
+// unrelated features, no PASS without TradingView proof.
+// ═══════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("SWINGTECH V6", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=500)
+
+// ============================================================================
+// SWINGTECH V5 = V4 engine (untouched) + confluence layer
+//   V4 core: structure labels, BOS-defined leg, fib, FVG boxes
+//   Added:   liquidity sweep, fixed-range volume profile (POC) on the leg,
+//            daily HTF bias, full checklist
+// ============================================================================
+
+// ---------------- INPUTS ----------------
+gS = "Structure"
+pivLen     = input.int(4, "Swing strength", minval=1, group=gS, tooltip="Bars each side that define a confirmed swing.")
+showTri    = input.bool(true,  "Swing triangles", group=gS)
+showLbl    = input.bool(true,  "HH / HL / LH / LL labels", group=gS)
+eqTolATR   = input.float(0.15, "Equal high/low tolerance (× ATR)", minval=0.0, step=0.05, group=gS)
+structLblSz  = input.string("Tiny", "HH / HL / LH / LL label size", options=["Tiny","Small","Normal","Large","Huge"], group=gS, tooltip="Size of the structure labels (HH, HL, LH, LL, EQH, EQL) printed at each confirmed swing.")
+structTriSz  = input.string("Tiny", "Swing triangle size", options=["Tiny","Small","Normal","Large"], group=gS, tooltip="Size of the swing-high / swing-low triangles.")
+structTxtCol = input.color(color.white, "Structure label text colour (when NOT coloured by type)", group=gS)
+structColByType = input.bool(true, "Colour labels by type", group=gS, tooltip="ON = HH/HL/LH/LL/EQ each get their own colour, so trend structure reads at a glance. OFF = every label uses the single text colour above.")
+colHH = input.color(color.new(#26a69a, 0), "HH", inline="sc1", group=gS)
+colHL = input.color(color.new(#66bb6a, 0), "HL", inline="sc1", group=gS)
+colLH = input.color(color.new(#ff9800, 0), "LH", inline="sc2", group=gS)
+colLL = input.color(color.new(#ef5350, 0), "LL", inline="sc2", group=gS)
+colEQx = input.color(color.new(#b0bec5, 0), "EQH / EQL", inline="sc3", group=gS)
+
+// ---- Pivot lines (additive) ----
+gPv = "Pivot Lines"
+showPivLn = input.bool(false, "Show pivot lines", group=gPv, tooltip="Draws a short horizontal line at every confirmed swing, coloured by its structure type. Off by default — it adds a line per pivot, so it is the densest thing in the script.")
+pivLnLen  = input.int(20, "Length (bars)", minval=1, maxval=300, group=gPv)
+pivLnExt  = input.bool(false, "Extend right instead", group=gPv, tooltip="ON = each pivot line runs to the right edge and 'Length' is ignored.")
+pivLnW    = input.int(1, "Width", minval=1, maxval=4, group=gPv)
+pivLnSty  = input.string("Dotted", "Style", options=["Solid","Dashed","Dotted"], group=gPv)
+pivLnMax  = input.int(40, "Max pivot lines kept (LRU)", minval=5, maxval=200, group=gPv, tooltip="Oldest pivot lines are removed past this cap so the script stays well under Pine's 500-line ceiling.")
+
+gF = "Fib"
+showFib    = input.bool(true, "Show fib on latest BOS leg", group=gF)
+oteLevel   = input.float(0.71, "OTE level", minval=0.1, maxval=0.9, step=0.01, group=gF)
+fibExtend  = input.int(15, "Extend right (bars)", minval=0, maxval=200, group=gF)
+showBosLn  = input.bool(true, "Show BOS marker", group=gF)
+oteTol     = input.float(0.06, "OTE confluence tolerance (± fib ratio)", minval=0.0, maxval=0.5, step=0.01, group=gF, tooltip="How close an FVG or the POC must sit to the OTE level to count as lining up.")
+
+gV = "FVG"
+showFVG    = input.bool(true, "Show FVGs inside the leg", group=gV)
+fvgMinATR  = input.float(0.0, "Min FVG size (× ATR)", minval=0.0, step=0.1, group=gV)
+fvgWidth   = input.int(4, "FVG box width (bars)", minval=1, maxval=50, group=gV)
+// --- FVG 50% mid line (additive; nothing above is affected) ---
+showFvgMid = input.bool(true, "FVG 50% mid line", group=gV, tooltip="Draws the midpoint (50%) of each FVG inside the leg. Green when the FVG is bullish (leg up), red when bearish (leg down). Purely additive — the FVG boxes themselves are unchanged.")
+colFvgMidBull = input.color(color.new(color.green, 20), "Mid line · bullish FVG", group=gV)
+colFvgMidBear = input.color(color.new(color.red,   20), "Mid line · bearish FVG", group=gV)
+fvgMidW    = input.int(1, "Mid line width", minval=1, maxval=4, group=gV)
+fvgMidSty  = input.string("Dashed", "Mid line style", options=["Solid","Dashed","Dotted"], group=gV)
+fvgMidExt  = input.int(0, "Mid line extra length (bars)", minval=0, maxval=200, group=gV, tooltip="0 = the mid line spans exactly the FVG box width. Raise it to project the level further right. Ignored when 'extend right' is on.")
+fvgMidExtM = input.string("None", "Mid line extend", options=["None","Right","Left","Both"], group=gV, tooltip="None = the 50% line spans only the box width (plus any extra bars above). Right = runs to the chart's right edge as a live reference. Left = runs back to the left edge. Both = full-width horizontal level across the whole chart.")
+
+gL = "Liquidity Sweep"
+showLS     = input.bool(true, "Mark liquidity sweep (if present)", group=gL, tooltip="Optional. Present when the leg's origin RAIDED a prior level — took it out with the wick and closed back inside. Never required, it just adds a check.")
+lsMode     = input.string("Standing level taken", "Sweep type", options=["Standing level taken", "Wick raid (strict close-back)"], group=gL, tooltip="Standing level taken (default): the origin's wick took out a level that was still standing, and the BOS itself proves the raid failed — price reversed and broke structure. Strict: additionally requires the sweep candle to close back inside the level. Use strict only if you want fewer, harder sweeps.")
+lsPivLen   = input.int(2, "Sweep level sensitivity", minval=1, maxval=5, group=gL, tooltip="Pivot strength used ONLY to find raidable levels — deliberately lighter than the triangle strength so sweeps of small unlabeled highs/lows are caught. Nothing extra is drawn on the chart. Lower = more levels considered.")
+lsLookback = input.int(120, "Sweep lookback (bars)", minval=10, maxval=400, group=gL, tooltip="How far back to look for the level the origin raided. Raise it to catch sweeps of levels from weeks ago.")
+lsMinPen   = input.float(0.0, "Min penetration (× ATR)", minval=0.0, step=0.05, group=gL, tooltip="How far past the level the wick must reach to count. 0 = any exceedance. Raise slightly to ignore sub-tick grazes.")
+
+gP = "Volume Profile"
+vpMode     = input.string("On", "Profile", options=["On", "Off"], group=gP)
+vpBins     = input.int(35, "Profile rows", minval=10, maxval=100, group=gP)
+vpLTF      = input.timeframe("15", "Intrabar timeframe", group=gP, tooltip="Volume is spread across each intrabar's range for accurate node placement, like TradingView's own FRVP.")
+vpWidth    = input.int(18, "Max profile width (bars)", minval=5, maxval=100, group=gP)
+vpOffset   = input.int(8, "Distance right of price (bars)", minval=0, maxval=100, group=gP)
+
+gH = "HTF Bias"
+biasTf     = input.timeframe("D", "Bias timeframe", group=gH)
+htfPiv     = input.int(3, "HTF swing strength", minval=2, group=gH)
+
+gC = "Colors"
+colFibLn   = input.color(color.new(color.gray, 10),   "Fib 0 / 1", group=gC)
+colOte     = input.color(color.new(color.yellow, 25), "OTE line", group=gC)
+colBos     = input.color(color.new(color.gray, 30),   "BOS", group=gC)
+colFvgBox  = input.color(color.new(color.gray, 80),   "FVG box", group=gC)
+colLSc     = input.color(color.new(color.red, 20),    "Liquidity sweep", group=gC)
+colVP      = input.color(color.new(color.gray, 70),   "Profile", group=gC)
+colPOC     = input.color(color.new(color.orange, 20), "POC", group=gC)
+
+gK = "Checklist"
+showChk    = input.bool(true, "Show checklist", group=gK)
+
+// ============================================================================
+// MTF FROZEN LEVELS (additive; original engine untouched)
+//   Detect BOS / LIQ / EQH / EQL on 1W, 1D, 4H via request.security and draw
+//   full-width horizontal lines at their exact prices. Because the detection
+//   runs on the fixed HTFs, the lines sit at IDENTICAL prices regardless of
+//   the chart TF you view (1H, 15m, 5m, ...). Non-repaint: lookahead_off.
+// ============================================================================
+gMT = "MTF Frozen Levels"
+mtfOn    = input.bool(true, "Enable MTF frozen levels", group=gMT)
+useTf3M  = input.bool(true, "Detect on 3M", group=gMT)
+useTfM   = input.bool(true, "Detect on 1M", group=gMT)
+useTfW   = input.bool(true, "Detect on 1W", group=gMT)
+useTf2D  = input.bool(true, "Detect on 2D", group=gMT)
+useTfD   = input.bool(true, "Detect on 1D", group=gMT)
+useTf4H  = input.bool(true, "Detect on 4H", group=gMT)
+useTf1H  = input.bool(true, "Detect on 1H", group=gMT)
+useTf30  = input.bool(true, "Detect on 30m", group=gMT)
+useTf15  = input.bool(true, "Detect on 15m", group=gMT)
+useTf5   = input.bool(true, "Detect on 5m", group=gMT)
+showBos  = input.bool(true, "Show BOS lines",        group=gMT)
+showLs   = input.bool(true, "Show LIQ (sweep) lines", group=gMT)
+showEqh  = input.bool(true, "Show EQH lines",         group=gMT)
+showEql  = input.bool(true, "Show EQL lines",         group=gMT)
+localInPool   = input.bool(true, "Include THIS chart's own levels (tag: LOC)", group=gMT, tooltip="Feeds the chart timeframe's own BOS / LS / EQH / EQL / FVG into the same pool as the MTF levels, so confluence and focus can rank them alongside everything else. Their authority weight matches the chart's timeframe.")
+mtfShowTag    = input.bool(true, "Show source-TF tag (W / D / 4H)", group=gMT)
+mtfLineW      = input.int(1, "Line width", minval=1, maxval=4, group=gMT)
+mtfLblOff     = input.int(5, "Label offset from right edge (bars)", minval=1, maxval=30, group=gMT)
+
+// ============================================================================
+// MTF FVG MID LINES (additive) — the 50% of each timeframe's latest bullish /
+// bearish FVG, frozen at chart-invariant prices. This is the imbalance grid:
+// the gap is where price moved too fast to transact, so its midpoint is where
+// the unfilled business sits — which is why it acts as magnet then wall.
+// Colour is by FVG DIRECTION (green = bullish gap, red = bearish gap), NOT by
+// position vs price, so overhead unfilled demand still reads green.
+// ============================================================================
+gMF = "MTF FVG Mid Lines"
+mtfFvgOn  = input.bool(true, "Enable MTF FVG 50% lines", group=gMF, tooltip="Detects FVGs on every enabled source TF (1W…5m) and draws the 50% of the latest bullish and bearish gap from each. Uses the same per-TF toggles as the MTF structure lines.")
+mtfFvgBull = input.bool(true, "Show bullish FVG 50%", group=gMF)
+mtfFvgBear = input.bool(true, "Show bearish FVG 50%", group=gMF)
+mtfFvgW    = input.int(1, "Line width", minval=1, maxval=4, group=gMF)
+mtfFvgSty  = input.string("Dashed", "Line style", options=["Solid","Dashed","Dotted"], group=gMF)
+mtfFvgTag  = input.bool(true, "Show source-TF tag", group=gMF)
+mtfFvgColMode = input.string("FVG direction", "FVG line colour by", options=["FVG direction","Price position"], group=gMF, tooltip="FVG direction (default) = green for a bullish gap, red for a bearish one, fixed for the level's life — so unfilled demand overhead still reads green. Price position = red whenever the level sits ABOVE current price, green when BELOW, so the line flips the moment price crosses it. Applies to the chart-TF FVG mid lines too.")
+
+// ============================================================================
+// CONFLUENCE (additive) — when two or more source TFs mark the SAME level of
+// the same type within tolerance, that agreement is worth more than either
+// level alone. Thickens the line and merges the tags into one (e.g. 1H+15m BOS).
+// ============================================================================
+gCf = "Confluence"
+conflOn       = input.bool(true, "Highlight confluence (2+ TFs at one level)", group=gCf, tooltip="A level marked independently by several timeframes is stronger than a single-TF level. This thickens those lines and, optionally, merges their labels so you see '1H+15m BOS' instead of two stacked tags.")
+conflATR      = input.float(0.15, "Confluence tolerance (× ATR)", minval=0.01, maxval=2.0, step=0.05, group=gCf, tooltip="How close two levels must be to count as the same level. Measured in chart-TF ATR.")
+conflW        = input.int(3, "Confluence line width", minval=1, maxval=8, group=gCf)
+conflMergeLbl = input.bool(true, "Merge labels into one tag", group=gCf)
+conflUseCol   = input.bool(false, "Override colour on confluence", group=gCf)
+conflCol      = input.color(color.new(color.yellow, 0), "Confluence colour", group=gCf)
+conflCrossType = input.bool(true, "Cross-type confluence (BOS + FVG + EQH at one price)", group=gCf, tooltip="OFF = only levels of the SAME type group (BOS with BOS). ON = group by price regardless of type, so a structural break sitting on an imbalance midpoint sitting on a liquidity shelf registers as one high-authority level — which is the strongest signal the engine can produce.")
+conflShowScore = input.bool(true, "Show weighted score in tag (★)", group=gCf, tooltip="Each source TF carries a weight (3M=10 · 1M=8 · W=6 · 2D=5 · D=4 · 4H=3 · 1H=2 · 30m=1.5 · 15m=1 · 5m=0.5). The group's score is the sum, so 2D+W = 11. Lets you rank every level by how much authority actually agrees on it.")
+conflMinScore  = input.float(0.0, "Hide levels below score", minval=0.0, maxval=40.0, step=0.5, group=gCf, tooltip="0 = show everything (default). Raise it to keep only high-authority levels: e.g. 5 drops everything below Weekly weight unless it is confluent. This is the cleanest density control in the engine — it filters by MEANING rather than by timeframe.")
+conflSameTfMult = input.float(0.4, "Same-TF stacking weight (independence discount)", minval=0.0, maxval=1.0, step=0.1, group=gCf, tooltip="Extra level TYPES from a timeframe already counted are worth this fraction of full weight. A Daily BOS + Daily FVG + Daily EQH at one price is ONE event described three ways — same candle series, correlated evidence — not three markets agreeing. At 0.4 that scores 4+1.6+1.6 = 7.2 instead of 12, so it correctly ranks below genuinely independent confluence like 2D+W = 11. Set to 1.0 for the old flat-sum behaviour.")
+conflDirAware  = input.bool(true, "Direction-aware (conflict is not agreement)", group=gCf, tooltip="ON = only levels pointing the SAME way reinforce each other. A bullish level and a bearish level at the same price are the market disagreeing, not agreeing — the opposing level adds nothing and the cluster is tagged CONFLICT. OFF reverts to raw proximity, where a bull/bear stack scored as though both sides were confirming.")
+conflSrcNorm   = input.bool(true, "Source-normalized proximity", group=gCf, tooltip="ON = 'how close is close' uses the SOURCE timeframe's ATR, taking the wider of the two levels being compared. A weekly level's neighbourhood is genuinely wider than a 5m level's. OFF uses the chart's ATR for everything, which makes grouping change as you switch timeframe.")
+
+// ============================================================================
+// FOCUS MODE (additive) — the three lines that matter RIGHT NOW.
+// Score measures authority; distance measures relevance. A ★11 level 130%
+// away is the strongest thing on the chart and useless today. Focus keeps the
+// nearest qualifying level ABOVE price and the nearest BELOW, hiding the rest
+// until price travels toward them — so the chart re-populates as it moves.
+// ============================================================================
+gFo = "Focus (3-line mode)"
+focusOn       = input.bool(false, "Focus mode — keep only ceiling + floor", group=gFo, tooltip="OFF (default) = show every level that passes the other filters. ON = hide everything except the nearest qualifying level above price and the nearest below, plus any level confluent with them. The set updates automatically as price travels.")
+focusMaxDistATR = input.float(10.0, "Max distance from price (× ATR)", minval=1.0, maxval=100.0, step=1.0, group=gFo, tooltip="A level further than this cannot be your ceiling or floor, however strong it is. Measured in CHART-TF ATR so it self-scales: on a 1M chart 10 ATR is a huge range, on 5m it is a session. This is what stops a monumental level 130% away from being picked.")
+focusMinScore = input.float(4.0, "Minimum score to qualify as ceiling / floor", minval=0.0, maxval=40.0, step=0.5, group=gFo, tooltip="A level must carry at least this much weighted authority to be eligible. 4.0 ≈ Daily weight, so intraday noise cannot become your ceiling. Raise it to demand HTF or confluent levels only.")
+// ============================================================================
+// LEVEL SCORECARD (additive) — has this level ever actually held?
+// Every level here is currently ranked by ASSUMED timeframe weight. This walks
+// history and counts what really happened when price reached it: a HOLD (came
+// to the level and reversed away) or a BREAK (closed decisively through).
+// Rationale: an untested level is not a neutral level — prior backtesting on
+// this project found untested levels get respected LESS than a random line,
+// while a level that has held even once improves markedly and keeps improving.
+// So "fresh" should be a penalty and "proven" should be a bonus.
+// ============================================================================
+gSc = "Level Scorecard"
+scOn        = input.bool(true, "Show hold record in tag (H/T)", group=gSc, tooltip="Appends the level's record to its label: (3/4) means price has come back to it four times SINCE IT FORMED and it held three of them. Blank means it has not been tested yet — which is now a real statement about this level, not an artefact of how far back the chart happened to look.")
+scFold      = input.bool(false, "Fold record into the ★ score", group=gSc, tooltip="OFF = the record is shown but does not change ranking. ON = untested and broken levels are demoted, proven levels promoted, so focus mode picks the level with the better track record rather than just the higher timeframe.")
+scUntested  = input.float(0.7, "Untested multiplier", minval=0.1, maxval=1.0, step=0.05, group=gSc, tooltip="Applied when a level has never been tested. Below 1.0 because untested levels historically underperform even a random line.")
+scFailed    = input.float(0.6, "Mostly-broken multiplier", minval=0.1, maxval=1.0, step=0.05, group=gSc, tooltip="Applied when breaks outnumber holds.")
+
+// ============================================================================
+// EXECUTION MODE (additive) — strip the map, watch the trigger.
+// Hides every MTF line so the chart shows ONLY this timeframe's own structure,
+// then watches the engine's checklist and flags when it completes.
+// ============================================================================
+gEx = "Execution Mode"
+execOn       = input.bool(false, "Execution mode", group=gEx, tooltip="Hides every MTF line so the chart shows only this timeframe's own structure — but the level engine keeps running underneath, because the entry rules USE those levels. Five independent conditions, all computed on every bar, so signals appear on history and can be reviewed.")
+execProfile  = input.string("Swing", "Style", options=["Scalp","Swing","Position","Custom"], group=gEx, tooltip="Same five rules, three risk appetites. Scalp wants nearby lower-authority levels and takes 1.5R. Position demands high-authority levels, reaches further, and wants 3R. Custom uses the four values below. Set your Bias timeframe to match: 1H for scalp, 1D swing, 1W position.")
+cMinLvl      = input.float(4.0, "Custom · min level authority", minval=0.5, maxval=20.0, step=0.5, group=gEx)
+cAtLvl       = input.float(1.0, "Custom · 'at level' band (× ATR)", minval=0.1, maxval=5.0, step=0.1, group=gEx)
+cBosAge      = input.int(50, "Custom · max bars since BOS", minval=3, maxval=300, group=gEx)
+cMinRR       = input.float(2.0, "Custom · min R:R", minval=0.5, maxval=10.0, step=0.25, group=gEx)
+execStopBuf  = input.float(0.5, "Stop buffer beyond level (× ATR)", minval=0.0, maxval=3.0, step=0.1, group=gEx, tooltip="Risk is measured to just beyond the level being defended, so a wick through it does not count as invalidation.")
+execKeepLocal = input.bool(true, "Keep this chart's own (LOC) lines visible", group=gEx, tooltip="ON = execution mode hides only the higher-timeframe levels; the chart's own BOS / LS / EQH / EQL / FVG stay drawn as extended lines. OFF = hide everything in the pool for a completely bare chart.")
+execTint     = input.bool(true, "Tint background when flagged", group=gEx)
+execLbl      = input.bool(true, "Show flag label", group=gEx)
+execMarks    = input.bool(true, "Plot historical triggers", group=gEx, tooltip="Marks every past bar where all conditions were met, so you can review how the rule set behaved instead of trusting it blind.")
+execTable    = input.bool(true, "Show condition breakdown", group=gEx)
+
+gTr = "Signal Tracker (walk-forward results)"
+trackOn     = input.bool(false, "Track signal outcomes", group=gTr, tooltip="Records every trigger's entry / stop / target, then walks FORWARD bar by bar to see which was hit first. No lookahead: a trade is only resolved by bars after its entry. Gives you the numbers instead of an impression.")
+trAllowMulti = input.bool(false, "Allow overlapping trades", group=gTr, tooltip="OFF = one position at a time, which is how you would actually trade it. ON = every trigger is recorded, which gives a larger sample but double-counts the same move.")
+trCooldown  = input.int(10, "Cooldown between entries (bars)", minval=0, maxval=200, group=gTr, tooltip="Stops one move being counted as many signals. This is event definition, not outcome filtering — it does not look at whether a trade won.")
+trMaxBars   = input.int(200, "Give up after (bars)", minval=10, maxval=1000, group=gTr, tooltip="A trade still open after this many bars is closed at market and its real R recorded, so results are not distorted by trades that never resolve.")
+trTable     = input.bool(true, "Show results table", group=gTr)
+
+gLf = "Level Lifecycle"
+lifeOn       = input.bool(true,  "Enforce level lifecycle", group=gLf, tooltip="Every level runs a state machine in ITS OWN source timeframe. A level that has been broken, swept, filled or retired contributes ZERO authority — only a confirmed flip brings it back. OFF reverts to the old behaviour where a latched level scores forever regardless of what price did to it.")
+lifeHideDead = input.bool(true,  "Hide dead levels", group=gLf, tooltip="ON = consumed / retired levels stop being drawn. OFF = they stay drawn, dimmed, so you can watch a lifecycle play out. Either way they score zero.")
+lifeDeadTr   = input.int(70, "Dead level transparency", minval=0, maxval=100, group=gLf, tooltip="Only used when 'Hide dead levels' is off.")
+lifeTouchATR = input.float(0.10, "Touch tolerance (ATR)", minval=0.0, maxval=2.0, step=0.05, group=gLf, tooltip="How close a SOURCE-timeframe bar must come to count as testing the level. Measured in the source timeframe's own ATR, so it means the same thing on a 3M level as on a 5m one.")
+lifeBreakATR = input.float(0.05, "Break buffer (ATR)", minval=0.0, maxval=2.0, step=0.05, group=gLf, tooltip="A source bar must CLOSE this far beyond the level to count as breaking it. Stops a close sitting exactly on the level from flipping the state back and forth.")
+lifeSweepATR = input.float(0.10, "Sweep penetration (ATR)", minval=0.0, maxval=2.0, step=0.05, group=gLf, tooltip="How far a wick must poke through an EQH/EQL shelf, without closing through, to count as having taken its liquidity rather than merely touching it.")
+
+gMm = "Level Memory (prospective)"
+memTolATR   = input.float(0.15, "Encounter zone (ATR)", minval=0.0, maxval=2.0, step=0.05, group=gMm, tooltip="How wide the zone around a level is, in the level's OWN source-timeframe ATR. Price entering this zone starts one encounter; it counts once no matter how many bars it stays.")
+memBreakATR = input.float(0.25, "Break buffer (ATR)", minval=0.0, maxval=2.0, step=0.05, group=gMm, tooltip="On leaving the zone, price must have closed this far past the level — on the opposite side to the one it arrived from — for the encounter to be recorded as a BREAK rather than a HOLD.")
+
+gDec = "Decision Engine (direction · location · lock)"
+locMinW           = input.float(1.0, "Minimum source authority for a tradeable level", minval=0.0, maxval=10.0, step=0.5, group=gDec, tooltip="A level below this weight can still be drawn and can still add confluence, but cannot itself be the level a trade is placed against. 1.0 = 15m and above.")
+locMaxDistATR     = input.float(2.0, "Maximum distance to a tradeable level (ATR)", minval=0.2, maxval=20.0, step=0.2, group=gDec, tooltip="Beyond this the level is real but not actionable today. Measured in chart ATR because this is a question about the chart you are trading, not about the level's own timeframe.")
+locRejectConflict = input.bool(true, "Refuse contested levels", group=gDec, tooltip="ON = a level with opposing evidence at the same price cannot be selected. Phase 7 could only TAG a conflict; this is where the tag bites, because the selected level is the one a stop gets placed behind.")
+lockMinScore      = input.float(4.0, "Score required to commit to a setup", minval=0.0, maxval=40.0, step=0.5, group=gDec, tooltip="The confluence score a candidate must reach before the engine will lock onto it. 4.0 is Daily weight — below that the setup is not worth committing to.")
+lockApproachATR   = input.float(0.6, "Approach band (ATR)", minval=0.05, maxval=5.0, step=0.05, group=gDec, tooltip="How close price must come to the selected level before the setup locks. Locking too early commits to a level price may never reach; too late and the sweep has already happened.")
+lockMaxBars       = input.int(60, "Release a lock after (bars)", minval=5, maxval=1000, group=gDec, tooltip="A lock that never resolves is released so the engine can look elsewhere. This is a timeout, not an invalidation - it says nothing about whether the level was good.")
+
+gTm = "Timing (entry sequence)"
+timeSweepATR   = input.float(0.10, "Entry sweep penetration (ATR)", minval=0.0, maxval=3.0, step=0.05, group=gTm, tooltip="How far price must wick THROUGH the locked level, then close back, to count as an attack that failed. This is the ENTRY sweep — an attack on the exact locked level — not the leg sweep, which is historical context and can never trigger anything.")
+timeReclaimATR = input.float(0.15, "Reclaim distance (ATR)", minval=0.0, maxval=3.0, step=0.05, group=gTm, tooltip="After the sweep, how decisively price must close back on the defended side. Prevents a close sitting on the level from counting as a reclaim.")
+timeMssPiv     = input.int(3, "MSS pivot length", minval=1, maxval=20, group=gTm, tooltip="The local counter-swing that must break to confirm a market structure shift. Deliberately small: this is a timing event on the chart timeframe, not a structural break on a higher one.")
+timeDispATR    = input.float(0.8, "Displacement bar size (ATR)", minval=0.0, maxval=5.0, step=0.1, group=gTm, tooltip="The shift must be delivered with intent rather than drift: the confirming bar's range must reach this multiple of ATR and close in the trade's direction. Set to 0 to accept any shift.")
+timeMaxBars    = input.int(30, "Abandon the sequence after (bars)", minval=3, maxval=500, group=gTm, tooltip="A timing sequence that stalls is abandoned so the engine can start again. Counted from the last stage advance, not from the lock.")
+
+gReg = "Level Registry (permanent membership)"
+lvlMaxTotal  = input.int(220, "Registry capacity", minval=20, maxval=450, group=gReg, tooltip="Hard ceiling on permanently-held levels. Pine caps lines and labels, so something must bound this. What gets evicted is decided by authority and lifecycle, never by age — see the protection setting below.")
+lvlProtectW  = input.float(4.0, "Never evict live levels at or above this weight", minval=0.0, maxval=10.0, step=0.5, group=gReg, tooltip="Macro protection. At 4.0 a live Daily, 2D, Weekly, Monthly or Quarterly level can never be evicted, whatever the capacity pressure — a W anchor must not vanish because newer 5m structure arrived. Dead levels are always evicted first regardless of source.")
+lvlDrawMax   = input.int(60, "Maximum lines drawn", minval=5, maxval=400, group=gReg, tooltip="VISIBILITY only. The registry keeps every level and the Brain scores every level; this decides how many are actually rendered, highest authority first. Changing it cannot change a decision.")
+lvlDrawDead  = input.bool(false, "Draw dead levels too", group=gReg, tooltip="Off by default: consumed levels stay in the registry and stay auditable in the debug table, but do not clutter the chart.")
+
+gDbg = "Canonical State (debug)"
+dbgOn   = input.bool(false, "Show canonical level table", group=gDbg, tooltip="Phase 3 verification view: every level's canonical state — source TF, type, price, event direction, positional role and lifecycle. Direction comes from the source EVENT; role is positional. A BULL level above price reads dir=BULL role=CEILING, which is exactly the distinction the old model could not express.")
+dbgRows = input.int(12, "Rows", minval=3, maxval=40, group=gDbg)
+dbgNear = input.bool(true, "Nearest to price first", group=gDbg)
+
+gMTc = "MTF Colors & Labels"
+colAbovePrice = input.color(color.new(color.red,   15), "Line ABOVE current price", group=gMTc, tooltip="Red for resistance (line sitting above current price).")
+colBelowPrice = input.color(color.new(color.green, 15), "Line BELOW current price", group=gMTc, tooltip="Green for support (line sitting below current price).")
+mtfLblSize    = input.string("Tiny", "Label size", options=["Tiny","Small","Normal","Large"], group=gMTc)
+mtfLblTextCol = input.color(color.white, "Label text color", group=gMTc)
+mtfLblMatch   = input.bool(true, "Label background matches line color (red/green)", group=gMTc, tooltip="On (default): the label's background badge uses the same red/green as its line. Off: uses the custom color below.")
+mtfLblBgCol   = input.color(color.new(color.black, 25), "Custom label background (when Match is OFF)", group=gMTc)
+
+// structure label / triangle size helpers (drive the HH·HL·LH·LL·EQH·EQL labels)
+// structure colour by label type — HH/HL bullish, LH/LL bearish, EQ neutral
+f_structCol(string _t) =>
+    structColByType ? (_t == "HH" ? colHH : _t == "HL" ? colHL : _t == "LH" ? colLH : _t == "LL" ? colLL : colEQx) : structTxtCol
+f_pivSty() =>
+    pivLnSty == "Solid" ? line.style_solid : pivLnSty == "Dashed" ? line.style_dashed : line.style_dotted
+var array<line> pivLines = array.new<line>()
+// chart-TF equal-high / equal-low latches, filled by the engine's pivot blocks
+var float locEqh = na
+var float locEql = na
+
+f_structSz() =>
+    structLblSz == "Tiny" ? size.tiny : structLblSz == "Small" ? size.small : structLblSz == "Normal" ? size.normal : structLblSz == "Large" ? size.large : size.huge
+
+atr = ta.atr(14)
+
+// intrabar data for the profile (global scope requirement)
+// ── PHASE 2 · SAFE LOWER-TF REQUEST ───────────────────────────────────────
+// Was: three separate security_lower_tf calls, and no check that the requested
+// intrabar TF is actually BELOW the chart TF. On a 1m/5m chart a "15m intrabar"
+// request is invalid and can halt the script.
+//
+// Now: the requested TF is validated against the chart TF and demoted to a
+// valid one when necessary; H/L/V travel in ONE tuple request instead of three.
+// If no valid lower TF exists (chart is already at the minimum), VP disables
+// itself gracefully rather than erroring.
+vpReqSec  = timeframe.in_seconds(vpLTF)
+vpChartSec = timeframe.in_seconds(timeframe.period)
+
+// pick the largest standard intrabar TF strictly below the chart TF
+f_vpFallback() =>
+    vpChartSec > 3600  ? "60" : vpChartSec > 900 ? "15" : vpChartSec > 300 ? "5" : vpChartSec > 60 ? "1" : "1"
+
+// Effective TF. request.security_lower_tf() requires a timeframe at or below
+// the chart's, so the value handed to it is ALWAYS clamped — the usability
+// flag decides whether the result is consumed, never whether the call is safe.
+vpEffTF  = vpReqSec < vpChartSec ? vpLTF : f_vpFallback()
+vpEffSec = timeframe.in_seconds(vpEffTF)
+vpUsable = vpEffSec < vpChartSec        // false on 1m (nothing strictly lower)
+
+// ONE tuple request instead of three separate ones. vpEffTF is <= chart TF by
+// construction, so this cannot raise an invalid-timeframe runtime error.
+[ltfH, ltfL, ltfV] = request.security_lower_tf(syminfo.tickerid, vpEffTF, [high, low, volume])
+
+// Data Window diagnostics required by the phase
+plot(vpReqSec,  "VP requested TF (s)", display = display.data_window)
+plot(vpEffSec,  "VP effective TF (s)", display = display.data_window)
+plot(vpUsable ? 1 : 0, "VP valid (1/0)", display = display.data_window)
+
+// ---------------- HTF BIAS (readout only) ----------------
+f_htfBias() =>
+    float hp = ta.pivothigh(high, htfPiv, htfPiv)
+    float lp = ta.pivotlow(low, htfPiv, htfPiv)
+    var float lH = na
+    var float pH = na
+    var float lL = na
+    var float pL = na
+    var int   hc = 0
+    var int   lc = 0
+    // PHASE 1: confirmed-source only
+    bool _biasConfirmed = barstate.isconfirmed
+    if _biasConfirmed and not na(hp)
+        pH := lH
+        lH := hp
+        hc := na(pH) ? 0 : hp > pH ? 1 : -1
+    if _biasConfirmed and not na(lp)
+        pL := lL
+        lL := lp
+        lc := na(pL) ? 0 : lp > pL ? 1 : -1
+    int b = hc == 1 and lc == 1 ? 1 : hc == -1 and lc == -1 ? -1 : 0
+    b
+
+htfBias = request.security(syminfo.tickerid, biasTf, f_htfBias(), lookahead=barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 5 · LEVEL LIFECYCLE ENGINES
+// ═══════════════════════════════════════════════════════════════════════════
+// Defect D3: levels were latched with no consumption semantics. A BOS that
+// price had closed straight through kept scoring at full authority until a
+// brand-new BOS happened to replace it, which can be many bars later. Dead
+// evidence was steering live decisions.
+//
+// Three properties make these correct rather than merely present:
+//
+//  1. SOURCE-OWNED. Each machine is called from inside f_stEvents/f_fvgMids,
+//     which run inside request.security(). Every comparison therefore uses the
+//     SOURCE timeframe's own close/high/low and its own ATR. A 15m wick cannot
+//     advance a 4H level's state. This is not a detail — evaluating lifecycle
+//     on chart bars is precisely how 4H levels got invalidated by 15m noise.
+//
+//  2. SINGLE-STEP. Each machine snapshots its state into `_s0` and branches on
+//     the snapshot, never on the live variable. Without that, two transitions
+//     could fire on one bar and a level could go ACTIVE → BROKEN → RETIRED in a
+//     single step.
+//
+//  3. STANDALONE `if`s, never `if/else`. Pine types every branch of an if/else
+//     and requires them to match; a branch ending in a bare inner `if` has no
+//     value while its sibling does, which is CE10235. Mutually-exclusive
+//     standalone ifs over a frozen `_s0` sidestep that entirely and are
+//     equivalent because `_s0` cannot change mid-bar.
+//
+// State codes are ints so they cost almost nothing inside a request.security
+// tuple; f_lifeName() maps them back for display.
+
+
+// ---------------- MTF EVENT DETECTOR (mirror of the chart engine, callable) ----
+// Returns [bosPx, bosDir, eqhPx, eqlPx, lsPx, lsDir] — each value is set ONLY
+// on the HTF bar where that event fires, na otherwise. Same rules as the chart
+// engine below (which stays untouched); this exists so we can run it on 1W /
+// 1D / 4H via request.security and freeze the levels at chart-invariant prices.
+// Byte-perfect port of the base engine's detection (lines 111-271 of swingtech
+// original). Every branch, threshold, scan bound and break condition matches so
+// events fired on 1W / 1D / 4H via request.security are IDENTICAL to what the
+// base engine would fire if the chart were on that TF.
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 15 · ONE FVG TRUTH SOURCE
+// ═══════════════════════════════════════════════════════════════════════════
+// The rule lives here ONCE. Both publishers — the per-source packet and the
+// chart-timeframe LOC path — call it, so a three-candle gap means exactly the
+// same thing everywhere and the two cannot drift apart with a threshold change.
+//
+// Returns [bullMid, bullTop, bullBot, bearMid, bearTop, bearBot]; na where no
+// gap formed on this bar. The caller decides what to latch and how to publish;
+// the DEFINITION is not the caller's business.
+f_fvgRaw(float _atrv) =>
+    float _bM = na
+    float _bT = na
+    float _bB = na
+    float _sM = na
+    float _sT = na
+    float _sB = na
+    if not na(high[2]) and low > high[2] and (low - high[2]) >= fvgMinATR * _atrv
+        _bM := math.avg(low, high[2])
+        _bT := low
+        _bB := high[2]
+    if not na(low[2]) and high < low[2] and (low[2] - high) >= fvgMinATR * _atrv
+        _sM := math.avg(low[2], high)
+        _sT := low[2]
+        _sB := high
+    [_bM, _bT, _bB, _sM, _sT, _sB]
+
+f_stEvents() =>
+    float _atr = ta.atr(14)
+    float _ph  = ta.pivothigh(high, pivLen, pivLen)
+    float _pl  = ta.pivotlow(low,  pivLen, pivLen)
+
+    var float _lastPH    = na
+    var int   _lastPHbar = na
+    var float _prevPH    = na
+    var float _lastPL    = na
+    var int   _lastPLbar = na
+    var float _prevPL    = na
+    var bool  _phBroken  = false
+    var bool  _plBroken  = false
+    var float _legAnchor  = na
+    var int   _legAnchorB = na
+    var int   _legDir     = 0
+
+    // LATCHED state (mirrors the engine's var bosLevel / lsLevel / leg state).
+    // These persist across bars and are what the engine itself would draw, so
+    // the MTF lines are a mirror of engine state — not an event history.
+    var float _eqhOut = na
+    var float _eqlOut = na
+    var float _bosOut = na
+    var int   _bosDirOut = 0
+    var float _lsOut  = na
+    var int   _lsDirOut = 0
+
+    // ── PHASE 1 · CONFIRMED-SOURCE PUBLICATION ────────────────────────────
+    // ta.* above must run every bar to keep their own series intact, but the
+    // LATCHES below may only advance on a fully closed source bar. Inside
+    // request.security() barstate.isconfirmed refers to the REQUESTED
+    // timeframe, so this publishes the last completed source-bar state and
+    // never a developing one. Consequence: identical value on every chart TF
+    // and across reloads, because a developing HTF bar can no longer leak in.
+    bool _srcConfirmed = barstate.isconfirmed
+    // pivot bookkeeping + EQH / EQL (same rule as base engine, incl. lastPHbar)
+    if _srcConfirmed and not na(_ph)
+        _prevPH    := _lastPH
+        _lastPH    := _ph
+        _lastPHbar := bar_index - pivLen
+        _phBroken  := false
+        if not na(_prevPH) and math.abs(_ph - _prevPH) <= eqTolATR * _atr
+            _eqhOut := _ph
+    if _srcConfirmed and not na(_pl)
+        _prevPL    := _lastPL
+        _lastPL    := _pl
+        _lastPLbar := bar_index - pivLen
+        _plBroken  := false
+        if not na(_prevPL) and math.abs(_pl - _prevPL) <= eqTolATR * _atr
+            _eqlOut := _pl
+
+    // BOS — anchor scan is bounded by the previous confirmed opposite pivot bar
+    // (matches base line 175 / 192: aScan = math.min(bar_index - lastPHbar, 480))
+    bool _newBos = false
+
+    if _srcConfirmed and not na(_lastPL) and not _plBroken and close < _lastPL and not na(_lastPH) and not na(_lastPHbar)
+        _plBroken := true
+        _legDir   := -1
+        float _aP = _lastPH
+        int   _aB = _lastPHbar
+        int   _aScan = math.min(bar_index - _lastPHbar, 480)
+        for i = 0 to _aScan
+            if high[i] > _aP
+                _aP := high[i]
+                _aB := bar_index - i
+        _legAnchor  := _aP
+        _legAnchorB := _aB
+        _bosOut     := _lastPL
+        _bosDirOut  := -1
+        _newBos     := true
+
+    if _srcConfirmed and not na(_lastPH) and not _phBroken and close > _lastPH and not na(_lastPL) and not na(_lastPLbar)
+        _phBroken := true
+        _legDir   := 1
+        float _aP = _lastPL
+        int   _aB = _lastPLbar
+        int   _aScan = math.min(bar_index - _lastPLbar, 480)
+        for i = 0 to _aScan
+            if low[i] < _aP
+                _aP := low[i]
+                _aB := bar_index - i
+        _legAnchor  := _aP
+        _legAnchorB := _aB
+        _bosOut     := _lastPH
+        _bosDirOut  := 1
+        _newBos     := true
+
+    // LS — same scan (aOff+1 .. min(aOff+lsLookback, 450)) and same accept rules.
+    // Engine resets lsLevel to na on every new BOS (line 229), so the latch only
+    // ever holds the CURRENT leg's sweep — or nothing if this leg had none.
+    if _srcConfirmed and _newBos and not na(_legAnchorB)
+        _lsOut    := na
+        _lsDirOut := 0
+        int   _aOff   = math.max(0, bar_index - _legAnchorB)
+        float _aClose = close[_aOff]
+        float _runMax = na
+        float _runMin = na
+        for j = _aOff + 1 to math.min(_aOff + lsLookback, 450)
+            if na(high[j]) or j < lsPivLen
+                break
+            bool _minorHi = true
+            bool _minorLo = true
+            for w = 1 to lsPivLen
+                if na(high[j + w]) or na(high[j - w])
+                    _minorHi := false
+                    _minorLo := false
+                else
+                    if high[j] < high[j + w] or high[j] < high[j - w]
+                        _minorHi := false
+                    if low[j]  > low[j + w]  or low[j]  > low[j - w]
+                        _minorLo := false
+            if _legDir == -1 and _minorHi
+                bool _standing = na(_runMax) or high[j] > _runMax
+                bool _took     = _legAnchor > high[j] + lsMinPen * _atr
+                bool _failed   = lsMode == "Standing level taken" or _aClose < high[j]
+                if _standing and _took and _failed
+                    _lsOut    := high[j]
+                    _lsDirOut := -1
+                    break
+            else if _legDir == 1 and _minorLo
+                bool _standing = na(_runMin) or low[j] < _runMin
+                bool _took     = _legAnchor < low[j] - lsMinPen * _atr
+                bool _failed   = lsMode == "Standing level taken" or _aClose > low[j]
+                if _standing and _took and _failed
+                    _lsOut    := low[j]
+                    _lsDirOut := 1
+                    break
+            _runMax := na(_runMax) ? high[j] : math.max(_runMax, high[j])
+            _runMin := na(_runMin) ? low[j]  : math.min(_runMin, low[j])
+
+    // ── PHASE 8 · PUBLISH THE CONFIRMED SOURCE BAR ────────────────────────
+    // Phases 5 and 6 ran one lifecycle and one memory accumulator per source,
+    // INSIDE this function. That was correct for a single latched level per
+    // (source, type) — but Phase 8 keeps every confirmed level permanently, and
+    // a request.security() context cannot host an unbounded number of machines.
+    //
+    // So the machines move to chart scope and this function publishes the raw
+    // material they need: the last CONFIRMED source bar and its ATR. The
+    // machines then step once per confirmed source bar, reading source OHLC.
+    // Source ownership is preserved exactly — a 15m chart bar still cannot
+    // advance a 4H level's state, because the 4H stepper only fires when the 4H
+    // bar time changes and only ever reads 4H prices.
+    //
+    // Net effect on width: four packed records and a touch count leave, four
+    // bar fields arrive. The tuple is 11 elements, the same as before Phase 7,
+    // with source ATR intact — the operator's instruction was to preserve
+    // source-normalized proximity, and restructuring rather than dropping is
+    // how that is honoured.
+    // ── PHASE 10 · TRUE STRUCTURE REGIME ──────────────────────────────────
+    // A latched BOS direction is an EVENT that happened once. It is not the
+    // same thing as the market's current structure, and the two diverge
+    // constantly: the last bullish BOS stays latched while price carves LH
+    // after LH. Anything that reads bosDir as "the trend" is reading a
+    // memory, not a state.
+    //
+    // Regime is read from the swing sequence instead, which is what structure
+    // actually means: HH + HL is an uptrend, LH + LL is a downtrend, and any
+    // mixture is genuinely MIXED rather than quietly rounded to a side.
+    var int _structOut = 0
+    if _srcConfirmed and not na(_lastPH) and not na(_prevPH) and not na(_lastPL) and not na(_prevPL)
+        bool _hh = _lastPH > _prevPH
+        bool _hl = _lastPL > _prevPL
+        bool _lh = _lastPH < _prevPH
+        bool _ll = _lastPL < _prevPL
+        _structOut := _hh and _hl ? 1 : _lh and _ll ? -1 : 0
+
+    var float _cH = na
+    var float _cL = na
+    var float _cC = na
+    var int   _cT = na
+    if _srcConfirmed
+        _cH := high
+        _cL := low
+        _cC := close
+        _cT := time
+
+    [_bosOut, _bosDirOut, _eqhOut, _eqlOut, _lsOut, _lsDirOut, _cH, _cL, _cC, _cT, _atr, _structOut]
+
+// ---------------- MTF FVG MID DETECTOR (callable, latched) ----------------
+// Same 3-candle rule and same min-gap filter the engine uses (see the FVG block
+// in the draw section): bullish gap = low > high[2], bearish = high < low[2].
+// Detects on EVERY bar of the source TF (not leg-gated) so the imbalance grid
+// is complete, and latches the most recent of each direction.
+f_fvgMids() =>
+    float _atrF = ta.atr(14)
+    var float _bullMid = na
+    var float _bearMid = na
+    // PHASE 5: the gap EDGES are latched alongside the midline. The lifecycle
+    // needs them to tell entering the gap from reaching consequent encroachment
+    // from filling it outright, and the midline alone cannot express that.
+    var float _bullTop = na
+    var float _bullBot = na
+    var float _bearTop = na
+    var float _bearBot = na
+    // PHASE 1: confirmed-source only — a developing source bar must not publish
+    bool _fvgConfirmed = barstate.isconfirmed
+    // PHASE 15: the shared rule, not a local copy of it
+    [_rbM, _rbT, _rbB, _rsM, _rsT, _rsB] = f_fvgRaw(_atrF)
+    if _fvgConfirmed and not na(_rbM)
+        _bullMid := _rbM
+        _bullTop := _rbT
+        _bullBot := _rbB
+    if _fvgConfirmed and not na(_rsM)
+        _bearMid := _rsM
+        _bearTop := _rsT
+        _bearBot := _rsB
+    // PHASE 8: gap EDGES cross over so the chart-side lifecycle can tell
+    // entering the gap from reaching the 50% from filling it outright. The
+    // source bar itself already crosses in the structure tuple for this TF, so
+    // nothing extra is needed here.
+    [_bullMid, _bearMid, _bullTop, _bullBot, _bearTop, _bearBot]
+
+// ---------------- MTF SECURITY CALLS + FROZEN LINE RENDERER ----------------
+[bosPxW, bosDirW, eqhPxW, eqlPxW, lsPxW, lsDirW, srcHW, srcLW, srcCW, srcTW, srcAtrW, srcStructW] = request.security(syminfo.tickerid, "W",   f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPxD, bosDirD, eqhPxD, eqlPxD, lsPxD, lsDirD, srcHD, srcLD, srcCD, srcTD, srcAtrD, srcStructD] = request.security(syminfo.tickerid, "D",   f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx4H, bosDir4H, eqhPx4H, eqlPx4H, lsPx4H, lsDir4H, srcH4H, srcL4H, srcC4H, srcT4H, srcAtr4H, srcStruct4H] = request.security(syminfo.tickerid, "240", f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx1H, bosDir1H, eqhPx1H, eqlPx1H, lsPx1H, lsDir1H, srcH1H, srcL1H, srcC1H, srcT1H, srcAtr1H, srcStruct1H] = request.security(syminfo.tickerid, "60",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx15, bosDir15, eqhPx15, eqlPx15, lsPx15, lsDir15, srcH15, srcL15, srcC15, srcT15, srcAtr15, srcStruct15] = request.security(syminfo.tickerid, "15",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx2D, bosDir2D, eqhPx2D, eqlPx2D, lsPx2D, lsDir2D, srcH2D, srcL2D, srcC2D, srcT2D, srcAtr2D, srcStruct2D] = request.security(syminfo.tickerid, "2D",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx30, bosDir30, eqhPx30, eqlPx30, lsPx30, lsDir30, srcH30, srcL30, srcC30, srcT30, srcAtr30, srcStruct30] = request.security(syminfo.tickerid, "30",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx5, bosDir5, eqhPx5, eqlPx5, lsPx5, lsDir5, srcH5, srcL5, srcC5, srcT5, srcAtr5, srcStruct5] = request.security(syminfo.tickerid, "5",   f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx3M, bosDir3M, eqhPx3M, eqlPx3M, lsPx3M, lsDir3M, srcH3M, srcL3M, srcC3M, srcT3M, srcAtr3M, srcStruct3M] = request.security(syminfo.tickerid, "3M",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPxM, bosDirM, eqhPxM, eqlPxM, lsPxM, lsDirM, srcHM, srcLM, srcCM, srcTM, srcAtrM, srcStructM] = request.security(syminfo.tickerid, "M",   f_stEvents(), lookahead=barmerge.lookahead_off)
+
+// MTF FVG 50% levels — one bullish + one bearish latch per source TF
+[fvgBullW, fvgBearW, fvgBullTopW, fvgBullBotW, fvgBearTopW, fvgBearBotW] = request.security(syminfo.tickerid, "W",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull2D, fvgBear2D, fvgBullTop2D, fvgBullBot2D, fvgBearTop2D, fvgBearBot2D] = request.security(syminfo.tickerid, "2D",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBullD, fvgBearD, fvgBullTopD, fvgBullBotD, fvgBearTopD, fvgBearBotD] = request.security(syminfo.tickerid, "D",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull4H, fvgBear4H, fvgBullTop4H, fvgBullBot4H, fvgBearTop4H, fvgBearBot4H] = request.security(syminfo.tickerid, "240", f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull1H, fvgBear1H, fvgBullTop1H, fvgBullBot1H, fvgBearTop1H, fvgBearBot1H] = request.security(syminfo.tickerid, "60",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull30, fvgBear30, fvgBullTop30, fvgBullBot30, fvgBearTop30, fvgBearBot30] = request.security(syminfo.tickerid, "30",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull15, fvgBear15, fvgBullTop15, fvgBullBot15, fvgBearTop15, fvgBearBot15] = request.security(syminfo.tickerid, "15",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull5, fvgBear5, fvgBullTop5, fvgBullBot5, fvgBearTop5, fvgBearBot5] = request.security(syminfo.tickerid, "5",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull3M, fvgBear3M, fvgBullTop3M, fvgBullBot3M, fvgBearTop3M, fvgBearBot3M] = request.security(syminfo.tickerid, "3M",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBullM, fvgBearM, fvgBullTopM, fvgBullBotM, fvgBearTopM, fvgBearBotM] = request.security(syminfo.tickerid, "M",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+// ═══════════════════════════════════════════════════════════════════════════
+// SHARED HELPERS — declared before the registry that consumes them
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILER-COMPATIBILITY (CE10271). These definitions previously sat BELOW the
+// level registry, which calls f_lifeAuth / f_tfWeight / f_slotRole. Pine
+// resolves user functions in declaration order, so a call above the definition
+// is 'Could not find function or function reference'.
+//
+// Moved verbatim — no line of any function body changed. Every dependency they
+// have is satisfied here: `atr` (line ~273), the inputs, and the srcAtr* values
+// from the security calls above, all of which precede this point.
+
+// ── PHASE 6 · f_levelRecord() REMOVED ─────────────────────────────────────
+// The retrospective scorecard scan lived here. It walked backwards through
+// CHART bars around today's level price, which meant it counted interactions
+// from before the level existed (hindsight contamination) and produced a
+// different number on every chart timeframe, because both its lookback window
+// and its ATR tolerance were the chart's rather than the level's source.
+// Replaced by f_lvlMem(), which accrues forward from birth in source context.
+// Deleted rather than left unused so nothing can quietly call it again.
+
+// PHASE 6: optional memory-state label. Raw counts stay the source of truth;
+// this is a reading of them, not a replacement.
+f_memState(int _t) =>
+    _t == 0 ? "M0 UNTESTED" : _t == 1 ? "M1 TESTED" : "M" + str.tostring(_t) + "+"
+
+// Track-record multiplier. Untested is a PENALTY, not neutral — that is the
+// whole point of the finding this is based on.
+f_provenMult(int _h, int _b) =>
+    int _t = _h + _b
+    _t == 0 ? scUntested : _b > _h ? scFailed : _h <= 1 ? 1.0 : _h == 2 ? 1.15 : 1.3
+
+// Seconds per bar of a level's OWN source TF — lets age be expressed in that
+// timeframe's bars, so "old" means the same thing for a 1M and a 5m level.
+f_srcSec(string _src) =>
+    _src == "LOC" ? timeframe.in_seconds(timeframe.period) : _src == "3M" ? timeframe.in_seconds("3M") : _src == "1M" ? timeframe.in_seconds("M") : _src == "W" ? timeframe.in_seconds("W") : _src == "2D" ? timeframe.in_seconds("2D") : _src == "D" ? timeframe.in_seconds("D") : _src == "4H" ? timeframe.in_seconds("240") : _src == "1H" ? timeframe.in_seconds("60") : _src == "30m" ? timeframe.in_seconds("30") : _src == "15m" ? timeframe.in_seconds("15") : timeframe.in_seconds("5")
+
+// Authority weight per source TF — a 3M level is not the same animal as a 5m
+// one, so confluence is scored by summed weight, not by a raw count of TFs.
+// weight for the chart's own timeframe, bucketed the same way as the sources
+f_chartWeight() =>
+    int _cs = timeframe.in_seconds(timeframe.period)
+    _cs >= timeframe.in_seconds("3M") ? 10.0 : _cs >= timeframe.in_seconds("M") ? 8.0 : _cs >= timeframe.in_seconds("W") ? 6.0 : _cs >= timeframe.in_seconds("2D") ? 5.0 : _cs >= timeframe.in_seconds("D") ? 4.0 : _cs >= timeframe.in_seconds("240") ? 3.0 : _cs >= timeframe.in_seconds("60") ? 2.0 : _cs >= timeframe.in_seconds("30") ? 1.5 : _cs >= timeframe.in_seconds("15") ? 1.0 : 0.5
+
+f_tfWeight(string _src) =>
+    _src == "LOC" ? f_chartWeight() : _src == "3M" ? 10.0 : _src == "1M" ? 8.0 : _src == "W" ? 6.0 : _src == "2D" ? 5.0 : _src == "D" ? 4.0 : _src == "4H" ? 3.0 : _src == "1H" ? 2.0 : _src == "30m" ? 1.5 : _src == "15m" ? 1.0 : 0.5
+
+// ── PHASE 4 · CANONICAL SOURCE IDENTITY ───────────────────────────────────
+// "LOC" is a DISPLAY ALIAS, never an identity. On a 30m chart the LOC pool and
+// the fixed 30m pool are the same candle series, so counting both is counting
+// one market twice — two "independent timeframes agreeing" that are in fact one
+// timeframe agreeing with itself.
+//
+// Matching is on EXACT seconds, NOT on the weight bucket. f_chartWeight() uses
+// >= thresholds, so a 45m chart buckets to the 30m WEIGHT — but a 45m series is
+// genuinely independent of the 30m series, so it keeps its own identity and
+// must NOT dedupe. Only an exact seconds match is the same series.
+f_srcCanon(string _src) =>
+    string _r = _src
+    if _src == "LOC"
+        int _cs = timeframe.in_seconds(timeframe.period)
+        _r := _cs == timeframe.in_seconds("3M") ? "3M" : _cs == timeframe.in_seconds("M") ? "1M" : _cs == timeframe.in_seconds("W") ? "W" : _cs == timeframe.in_seconds("2D") ? "2D" : _cs == timeframe.in_seconds("D") ? "D" : _cs == timeframe.in_seconds("240") ? "4H" : _cs == timeframe.in_seconds("60") ? "1H" : _cs == timeframe.in_seconds("30") ? "30m" : _cs == timeframe.in_seconds("15") ? "15m" : _cs == timeframe.in_seconds("5") ? "5m" : "LOC"
+    _r
+
+// ── PHASE 5 · LIFECYCLE NAMING AND AUTHORITY ──────────────────────────────
+// The state machines publish ints; these two turn them back into meaning.
+f_lifeName(string _typ, int _st) =>
+    string _n = "?"
+    if _typ == "BOS"
+        _n := _st == 0 ? "ACTIVE" : _st == 1 ? "TESTED" : _st == 2 ? "PRESSURED" : _st == 3 ? "BROKEN" : _st == 4 ? "FLIP_CAND" : _st == 5 ? "RETESTING" : _st == 6 ? "FLIP_OK" : _st == 7 ? "FAILED" : "RETIRED"
+    if _typ == "LS"
+        _n := _st == 0 ? "SWEPT" : _st == 1 ? "OWNED" : _st == 2 ? "RECLAIMED" : "RETIRED"
+    if _typ == "EQH" or _typ == "EQL"
+        _n := _st == 0 ? "SHELF" : _st == 1 ? "ATTACKED" : _st == 2 ? "SWEPT" : _st == 3 ? "BROKEN" : _st == 4 ? "RETIRED" : "FLIPPED"
+    if _typ == "FVG+" or _typ == "FVG-"
+        _n := _st == 0 ? "BORN" : _st == 1 ? "ACTIVE" : _st == 2 ? "PARTIAL" : _st == 3 ? "MITIGATED" : _st == 4 ? "FILLED" : "RETIRED"
+    _n
+
+// THE PHASE 5 EXIT GATE, MADE EXECUTABLE:
+//   "A consumed/retired level contributes zero production authority unless
+//    explicitly reactivated by a valid flip lifecycle."
+// Binary on purpose. A graded decay (PRESSURED worth 0.7, say) would be an
+// invented number: the operator's own walk-forward work found interaction
+// counts to be a contaminated predictor, so this does not pretend to grade
+// health. A level is either still live evidence or it is spent.
+//   BOS  live: ACTIVE / TESTED / PRESSURED, plus FLIP_CONFIRMED (the explicit
+//              reactivation the gate allows)
+//   LS   live: SWEPT / OWNED
+//   EQ   live: ACTIVE_SHELF / ATTACKED, plus FLIPPED
+//   FVG  live: BORN / ACTIVE / PARTIAL_FILL — MITIGATED means the midline this
+//              layer draws has already been traded through
+f_lifeAuth(string _typ, int _st) =>
+    float _a = 1.0
+    if _typ == "BOS"
+        _a := _st <= 2 or _st == 6 ? 1.0 : 0.0
+    if _typ == "LS"
+        _a := _st <= 1 ? 1.0 : 0.0
+    if _typ == "EQH" or _typ == "EQL"
+        _a := _st <= 1 or _st == 5 ? 1.0 : 0.0
+    if _typ == "FVG+" or _typ == "FVG-"
+        _a := _st <= 2 ? 1.0 : 0.0
+    lifeOn ? _a : 1.0
+
+// ── PHASE 7 · DIRECTION COMPATIBILITY AND SOURCE-NORMALIZED PROXIMITY ─────
+// Defect D5: confluence combined anything that was merely CLOSE. Two levels
+// pointing opposite ways at one price is the market DISAGREEING; scoring it as
+// agreement rewarded conflict as confirmation.
+//
+// Compatible = same direction. NEUTRAL takes no side, so it is compatible with
+// either without being conflict — it reinforces, it does not oppose.
+f_dirCompat(string _d1, string _d2) =>
+    conflDirAware ? (_d1 == _d2 or _d1 == "NEUTRAL" or _d2 == "NEUTRAL") : true
+
+// A source timeframe's own ATR, published across by f_stEvents. Falls back to
+// the chart ATR for LOC (whose source IS the chart) and for anything unmapped.
+f_srcAtr(string _src) =>
+    float _r = _src == "3M" ? srcAtr3M : _src == "1M" ? srcAtrM : _src == "W" ? srcAtrW : _src == "2D" ? srcAtr2D : _src == "D" ? srcAtrD : _src == "4H" ? srcAtr4H : _src == "1H" ? srcAtr1H : _src == "30m" ? srcAtr30 : _src == "15m" ? srcAtr15 : _src == "5m" ? srcAtr5 : atr
+    na(_r) or _r <= 0 ? atr : _r
+
+// "Close enough to be the same level", judged at the scale of the WIDER of the
+// two sources. Using the chart's ATR for this — as the old code did — made
+// grouping change every time the chart timeframe changed, which is the same
+// class of bug as measuring a 4H level's lifecycle with 15m bars.
+f_pairTol(string _s1, string _s2) =>
+    float _base = conflSrcNorm ? math.max(f_srcAtr(_s1), f_srcAtr(_s2)) : atr
+    math.max(conflATR * _base, syminfo.mintick)
+
+// Positional role. Deliberately separate from `dir`: a BULL level sitting above
+// price is still BULL (unfilled demand) but its ROLE is CEILING.
+f_slotRole(float _px) =>
+    float _b = 0.15 * atr
+    _px > close + _b ? "CEILING" : _px < close - _b ? "FLOOR" : "CONTESTED"
+
+
+
+// ONE persistent slot per (source TF, event type). Each slot MIRRORS the
+// engine's latched state for that TF: when the engine's bosLevel / lsLevel /
+// EQH / EQL changes, the slot's line moves to the new price. Nothing
+// accumulates and nothing is deleted on a price cross — exactly what the
+// base engine draws on its own chart, replicated for W / D / 4H.
+// ── PHASE 3 · CANONICAL LEVEL MODEL ───────────────────────────────────────
+// One state carries everything a level MEANS, so no downstream module has to
+// guess. Direction comes from the SOURCE EVENT and is never inferred from where
+// the line sits relative to price — that is what `role` is for. Rendering reads
+// this state; it never defines it.
+//
+//   dir    BULL | BEAR | NEUTRAL      from the event that created the level
+//   role   FLOOR | CEILING | CONTESTED  positional, recomputed each bar
+//   state  lifecycle (Phase 5 drives the transitions; born ACTIVE here)
+//   authority  source-TF weight, cached so ranking never recomputes it
+//   owner  Phase 17 observational field, unused by any decision
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 8 · PERMANENT LEVEL REGISTRY
+// ═══════════════════════════════════════════════════════════════════════════
+// The old Lvl held ONE slot per (source, type) and MOVED its price when the
+// source latch advanced. That is a state mirror, and it breaks two of the rules
+// this architecture is now built on:
+//
+//   * a level's price was mutable, so "the Weekly BOS" silently became a
+//     different price with the same identity — nothing downstream could tell
+//     that the level it scored last bar is not the level it is scoring now;
+//   * history was destroyed on every advance, so a Weekly BOS from eight months
+//     ago — still unbroken, still the most important line on the chart — simply
+//     ceased to exist the moment a newer one formed.
+//
+// The registry replaces it. Fields are split hard into two halves:
+//
+//   IMMUTABLE AFTER CONFIRMATION — id, px, src, typ, dir, birth, birthSrc.
+//     Written once at registration and never again. A latch advancing to a new
+//     price REGISTERS A NEW LEVEL; it does not edit an existing one. This is
+//     what makes a level ID meaningful enough for Phase 12 to lock onto.
+//
+//   MUTABLE — lifecycle, memory, role, render handles. A level's STATE evolves;
+//     its IDENTITY does not.
+//
+// Membership is permanent and causal: a level enters the registry when its
+// source confirms it and leaves only under explicit capacity pressure, never
+// because it got old. Recency is not evidence.
+type Lvl
+    // ── immutable after confirmation ──────────────────────────────────────
+    int    id
+    float  px
+    string src
+    string typ
+    string dir
+    int    birth        // chart bar_index at registration
+    int    birthSrc     // SOURCE bar time at registration — the causal cutoff
+    float  halfW        // FVG only: half the gap height, so the edges are
+                        // recoverable from the midline. Immutable like px:
+                        // the gap that formed does not change size later.
+    // ── mutable state ─────────────────────────────────────────────────────
+    int    life
+    int    touches
+    int    holds
+    int    breaks
+    bool   inZone       // memory: mid-encounter
+    int    fromSide     // memory: +1 entered from above, -1 from below
+    int    tch          // lifecycle: BOS test count
+    string role
+    float  authority
+    string owner
+    // ── render ────────────────────────────────────────────────────────────
+    line   ln
+    label  lb
+
+var array<Lvl> levels  = array.new<Lvl>()
+// COMPILER-COMPATIBILITY (CE10088). Pine forbids rebinding a global scalar
+// inside a function, but permits MUTATING a global object — which is why the
+// array.push into `levels` below is legal while `lvlSeq += 1` was not. The
+// counter is therefore held in a one-element array. Identical behaviour: it
+// starts at 0, increments once per registration, is never reused, and never
+// decreases when a level is evicted — which is what makes a level id safe for
+// Phase 12 to lock onto.
+var array<int> lvlSeqBox = array.new<int>(1, 0)
+
+// Chart-side mirror of the immutable-price rule: two levels are THE SAME level
+// only if source, type and price all match. Price equality uses a mintick
+// epsilon rather than `==` because the value has made a round trip through
+// request.security and float equality across that boundary is not a promise
+// worth relying on.
+f_lvlFind(string _src, string _typ, float _px) =>
+    int _r = -1
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            Lvl _l = array.get(levels, i)
+            if _l.src == _src and _l.typ == _typ and math.abs(_l.px - _px) <= syminfo.mintick
+                _r := i
+                break
+    _r
+
+// ── PHASE 8 · CAPACITY POLICY — NO RECENCY EVICTION ───────────────────────
+// Permanent membership still meets a hard ceiling: Pine caps lines and labels,
+// and an unbounded registry would eventually exhaust them. The policy decides
+// what goes, and the ordering is the whole point:
+//
+//   1. DEAD levels go first, oldest first. A consumed level has already told
+//      us everything it is going to.
+//   2. Only if every level is still live does anything live get evicted, and
+//      then it is the LOWEST AUTHORITY that goes — a 5m level, never the
+//      Weekly one.
+//   3. Macro sources at or above the protection threshold are never evicted
+//      while live, at any capacity. A W/D anchor does not disappear because
+//      newer 5m structure arrived; that is exactly the failure Phase 8 exists
+//      to prevent.
+//
+// Age is deliberately absent as a criterion for live levels. An eight-month-old
+// unbroken Weekly BOS is the strongest line on the chart, not the stalest.
+f_evictOne() =>
+    int   _worst   = -1
+    float _worstSc = 1.0e18
+    int   _oldest  = -1
+    int   _oldestB = 2147483647
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            Lvl _l = array.get(levels, i)
+            bool _live = f_lifeAuth(_l.typ, _l.life) > 0.0
+            // dead levels: pick the oldest
+            if not _live and _l.birth < _oldestB
+                _oldestB := _l.birth
+                _oldest  := i
+            // live levels: pick the lowest authority, macro exempt
+            if _live and f_tfWeight(_l.src) < lvlProtectW
+                float _sc = f_tfWeight(_l.src)
+                if _sc < _worstSc
+                    _worstSc := _sc
+                    _worst   := i
+    int _victim = _oldest >= 0 ? _oldest : _worst
+    if _victim >= 0
+        Lvl _v = array.get(levels, _victim)
+        line.delete(_v.ln)
+        label.delete(_v.lb)
+        Lvl _rm = array.remove(levels, _victim)
+    _victim
+
+// ── PHASE 8 · REGISTRATION ────────────────────────────────────────────────
+// A confirmed source price either already exists in the registry — in which
+// case nothing happens, because identity is immutable and re-registering would
+// be an edit — or it is genuinely new and gets its own permanent entry.
+//
+// `_srcTime` is stored as birthSrc and is the CAUSAL CUTOFF: memory may only
+// count encounters on source bars strictly after it. That single field is what
+// makes prospective memory provable rather than asserted.
+f_lvlRegister(float _px, string _src, string _typ, string _dir, int _srcTime, bool _enabled, float _halfW) =>
+    int _idx = -1
+    if _enabled and not na(_px) and not na(_srcTime)
+        _idx := f_lvlFind(_src, _typ, _px)
+        if _idx < 0
+            if array.size(levels) >= lvlMaxTotal
+                int _e = f_evictOne()
+            if array.size(levels) < lvlMaxTotal
+                int _newId = array.get(lvlSeqBox, 0) + 1
+                array.set(lvlSeqBox, 0, _newId)
+                array.push(levels, Lvl.new(_newId, _px, _src, _typ, _dir, bar_index, _srcTime, _halfW, 0, 0, 0, 0, false, 0, 0, f_slotRole(_px), f_tfWeight(_src), "", na, na))
+                _idx := array.size(levels) - 1
+    _idx
+
+// ── PHASE 8 · SOURCE-DRIVEN LIFECYCLE + MEMORY STEP ───────────────────────
+// Phases 5 and 6 defined these rules; Phase 8 relocates where they run without
+// changing what they mean. The stepper fires ONCE per confirmed source bar —
+// detected by the published source bar time changing — and reads only that
+// source's OHLC and ATR. A 15m chart bar cannot advance a 4H level, because the
+// 4H stepper does not fire on it and would have no 4H prices to read if it did.
+//
+// Causality is enforced here, not assumed: a bar at or before birthSrc is
+// refused outright, so a level can never accrue memory from its own creation or
+// from anything that happened before it existed.
+f_lvlStep(int _i, float _h, float _l, float _c, float _atrv, int _srcTime, bool _newSrcBar) =>
+    if _i >= 0 and _newSrcBar and not na(_h) and not na(_atrv) and _atrv > 0
+        Lvl _v = array.get(levels, _i)
+        // CAUSAL GUARD — the rule that makes memory prospective
+        if _srcTime > _v.birthSrc
+            float _px = _v.px
+            // ---- lifecycle ----
+            int _s0 = _v.life
+            float _tolL = lifeTouchATR * _atrv
+            float _bufL = lifeBreakATR * _atrv
+            float _pen  = lifeSweepATR * _atrv
+            bool _touch = _l <= _px + _tolL and _h >= _px - _tolL
+            if _v.typ == "BOS" or _v.typ == "LS"
+                int _d = _v.dir == "BULL" ? 1 : -1
+                bool _through = _d == 1 ? _c < _px - _bufL : _c > _px + _bufL
+                bool _back    = _d == 1 ? _c > _px + _bufL : _c < _px - _bufL
+                if _v.typ == "BOS"
+                    if _s0 <= 2 and _through
+                        _v.life := 3
+                    if _s0 <= 2 and not _through and _touch
+                        _v.tch  += 1
+                        _v.life := _v.tch <= 1 ? 1 : 2
+                    if _s0 == 3
+                        _v.life := 4
+                    if _s0 == 4 and _back
+                        _v.life := 7
+                    if _s0 == 4 and not _back and _touch
+                        _v.life := 5
+                    if _s0 == 5 and _back
+                        _v.life := 7
+                    if _s0 == 5 and not _back and _through
+                        _v.life := 6
+                    if _s0 == 6 and _back
+                        _v.life := 7
+                    if _s0 == 7 and _through
+                        _v.life := 4
+                if _v.typ == "LS"
+                    // dir here is the SWEEP direction: BULL = a low was run
+                    bool _away    = _d == 1 ? _c > _px + _bufL : _c < _px - _bufL
+                    bool _reclaim = _d == 1 ? _c < _px - _bufL : _c > _px + _bufL
+                    if _s0 == 0 and _away
+                        _v.life := 1
+                    if _s0 <= 1 and _reclaim
+                        _v.life := 2
+                    if _s0 == 2
+                        _v.life := 3
+            if _v.typ == "EQH" or _v.typ == "EQL"
+                bool _isHi  = _v.typ == "EQH"
+                bool _wick  = _isHi ? _h > _px + _pen : _l < _px - _pen
+                bool _cthru = _isHi ? _c > _px       : _c < _px
+                bool _tchEq = _isHi ? _h >= _px - _tolL : _l <= _px + _tolL
+                if _s0 <= 1 and _cthru
+                    _v.life := 3
+                if _s0 <= 1 and not _cthru and _wick
+                    _v.life := 2
+                if _s0 <= 1 and not _cthru and not _wick and _tchEq
+                    _v.life := 1
+                if _s0 == 2
+                    _v.life := 4
+                if _s0 == 3 and not _cthru
+                    _v.life := 5
+            if _v.typ == "FVG+" or _v.typ == "FVG-"
+                // Edges recovered from the immutable midline + half-width.
+                bool _isB = _v.typ == "FVG+"
+                float _top = _px + _v.halfW
+                float _bot = _px - _v.halfW
+                bool _enter = _isB ? _l <= _top : _h >= _bot
+                bool _mitig = _isB ? _l <= _px  : _h >= _px
+                bool _full  = _isB ? _l <= _bot : _h >= _top
+                if _s0 == 0
+                    _v.life := 1
+                if _s0 >= 1 and _s0 <= 3 and _full
+                    _v.life := 4
+                if _s0 >= 1 and _s0 <= 2 and not _full and _mitig
+                    _v.life := 3
+                if _s0 == 1 and not _full and not _mitig and _enter
+                    _v.life := 2
+                if _s0 == 4
+                    _v.life := 5
+            // ---- prospective memory (Phase 6 rules, unchanged) ----
+            float _tolM = memTolATR * _atrv
+            float _bufM = memBreakATR * _atrv
+            bool _inZ   = _l <= _px + _tolM and _h >= _px - _tolM
+            bool _abv   = _c > _px + _bufM
+            bool _blw   = _c < _px - _bufM
+            if _inZ and not _v.inZone
+                _v.inZone   := true
+                _v.touches  += 1
+                _v.fromSide := _c > _px ? 1 : -1
+            if not _inZ and _v.inZone
+                _v.inZone := false
+                if _v.fromSide != 0
+                    bool _crossed = _v.fromSide == 1 ? _blw : _abv
+                    if _crossed
+                        _v.breaks += 1
+                    if not _crossed
+                        _v.holds += 1
+            array.set(levels, _i, _v)
+    int _done = 0
+
+// color rule: red above current price, green below (re-evaluated every bar)
+f_lvlCol(float _px) =>
+    _px > close ? colAbovePrice : colBelowPrice
+
+// FVG mid-line colour: either fixed by the gap's direction, or flipped live by
+// where the level sits relative to price (so it changes the bar price crosses).
+f_fvgCol(bool _isBull, float _px) =>
+    mtfFvgColMode == "Price position" ? (_px > close ? colAbovePrice : colBelowPrice) : (_isBull ? colFvgMidBull : colFvgMidBear)
+
+// label size + background helpers driven by the "Colors & Labels" inputs
+f_lblSz(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Normal" ? size.normal : size.large
+
+f_lblBg(color _lineCol) =>
+    mtfLblMatch ? _lineCol : mtfLblBgCol
+
+// ── PHASE 8 · RENDERER ────────────────────────────────────────────────────
+// Rendering is now strictly downstream of the registry: it reads level state
+// and never writes it. That separation is the plan's "Brain universe vs Visual
+// universe" made structural rather than promised — hiding a line, focus mode
+// putting a level to sleep, or execution mode blanking the map cannot change
+// what the Brain believes, because none of them touch the registry.
+f_mtfFvgStyle() =>
+    mtfFvgSty == "Solid" ? line.style_solid : mtfFvgSty == "Dotted" ? line.style_dotted : line.style_dashed
+
+// ── D20 · TYPE VISIBILITY — RENDER ONLY ───────────────────────────────────
+// The display toggles live here now, and only here. This function is called by
+// the draw pass and by nothing else; no value it returns can reach the
+// registry, the score, the lock, the risk numbers or GO.
+//
+// `useTf*` and `localInPool` are deliberately NOT here. Those select which
+// SOURCES the engine consults — evidence selection, a Brain input — and they
+// legitimately continue to gate ingest.
+f_lvlTypeVisible(string _typ) =>
+    _typ == "BOS" ? showBos : _typ == "LS" ? showLs : _typ == "EQH" ? showEqh : _typ == "EQL" ? showEql : _typ == "FVG+" ? (mtfFvgOn and mtfFvgBull) : _typ == "FVG-" ? (mtfFvgOn and mtfFvgBear) : true
+
+f_lvlStyle(string _typ) =>
+    _typ == "FVG+" or _typ == "FVG-" ? f_mtfFvgStyle() : line.style_solid
+
+f_lvlColour(int _i) =>
+    Lvl _l = array.get(levels, _i)
+    bool _dead = lifeOn and f_lifeAuth(_l.typ, _l.life) == 0.0
+    color _base = _l.typ == "FVG+" or _l.typ == "FVG-" ? f_fvgCol(_l.dir == "BULL", _l.px) : f_lvlCol(_l.px)
+    _dead ? color.new(_base, lifeDeadTr) : _base
+
+// Draw or update one registry entry. `_show` is a pure VISIBILITY decision.
+f_lvlDraw(int _i, bool _show) =>
+    if _i >= 0
+        Lvl _l = array.get(levels, _i)
+        bool _dead = lifeOn and f_lifeAuth(_l.typ, _l.life) == 0.0
+        bool _want = _show and not (_dead and lifeHideDead)
+        bool _isFvg = _l.typ == "FVG+" or _l.typ == "FVG-"
+        bool _tagOn = _isFvg ? mtfFvgTag : mtfShowTag
+        int  _w     = _isFvg ? mtfFvgW : mtfLineW
+        if not _want
+            line.delete(_l.ln)
+            label.delete(_l.lb)
+            _l.ln := na
+            _l.lb := na
+        if _want
+            color _c = f_lvlColour(_i)
+            if na(_l.ln)
+                _l.ln := line.new(bar_index - 1, _l.px, bar_index, _l.px, xloc=xloc.bar_index, extend=extend.both, color=_c, width=_w, style=f_lvlStyle(_l.typ))
+            if not na(_l.ln)
+                line.set_color(_l.ln, _c)
+                line.set_width(_l.ln, _w)
+                line.set_style(_l.ln, f_lvlStyle(_l.typ))
+            if _tagOn and na(_l.lb)
+                _l.lb := label.new(bar_index + mtfLblOff, _l.px, _l.src + " " + _l.typ, xloc.bar_index, yloc.price, f_lblBg(_c), label.style_label_left, mtfLblTextCol, f_lblSz(mtfLblSize))
+            if not _tagOn and not na(_l.lb)
+                label.delete(_l.lb)
+                _l.lb := na
+            if not na(_l.lb)
+                label.set_x(_l.lb, bar_index + mtfLblOff)
+                label.set_y(_l.lb, _l.px)
+                label.set_color(_l.lb, f_lblBg(_c))
+                label.set_textcolor(_l.lb, mtfLblTextCol)
+                label.set_size(_l.lb, f_lblSz(mtfLblSize))
+        // role is positional and therefore genuinely mutable — it is a fact
+        // about where price is now, not about the level's identity
+        _l.role := f_slotRole(_l.px)
+        array.set(levels, _i, _l)
+    int _drawn = 0
+
+// ── PHASE 8 · PER-SOURCE INGEST ───────────────────────────────────────────
+// One call per source timeframe. Registers whatever that source currently
+// publishes, then steps EVERY level belonging to that source — including ones
+// registered months ago — against the source's newly confirmed bar.
+//
+// Stepping every level of the source (not just the newest) is what makes
+// historical membership meaningful: an eight-month-old Weekly BOS keeps
+// updating its lifecycle and memory for as long as it exists.
+f_ingest(string _src, float _bosPx, int _bosDir, float _eqh, float _eql, float _lsPx, int _lsDir, float _fvgB, float _fvgBTop, float _fvgBBot, float _fvgS, float _fvgSTop, float _fvgSBot, float _h, float _l, float _c, float _atrv, int _srcTime, bool _enabled) =>
+    bool _new = _enabled and not na(_srcTime) and (na(_srcTime[1]) or _srcTime != _srcTime[1])
+    if _enabled
+        // ── D20 · REGISTRATION IS UNCONDITIONAL ───────────────────────────
+        // These six calls previously took showBos / showLs / showEqh / showEql
+        // and mtfFvgOn/mtfFvgBull/mtfFvgBear as their `_enabled` argument. Every
+        // one of those is a DISPLAY control ("Show BOS lines", "Show bullish
+        // FVG 50%"), so unchecking a box removed evidence from the registry and
+        // therefore changed confluence, location selection, the lock, the stop
+        // and ultimately GO. A checkbox could move a trade.
+        //
+        // The Brain now sees everything its enabled SOURCES publish. What is
+        // drawn is decided in f_lvlDraw and nowhere else.
+        int _r1 = f_lvlRegister(_bosPx, _src, "BOS", _bosDir == 1 ? "BULL" : "BEAR", _srcTime, true, 0.0)
+        int _r2 = f_lvlRegister(_lsPx,  _src, "LS",  _lsDir  == 1 ? "BULL" : "BEAR", _srcTime, true, 0.0)
+        int _r3 = f_lvlRegister(_eqh,   _src, "EQH", "BEAR", _srcTime, true, 0.0)
+        int _r4 = f_lvlRegister(_eql,   _src, "EQL", "BULL", _srcTime, true, 0.0)
+        int _r5 = f_lvlRegister(_fvgB,  _src, "FVG+", "BULL", _srcTime, true, na(_fvgBTop) or na(_fvgBBot) ? 0.0 : math.abs(_fvgBTop - _fvgBBot) / 2.0)
+        int _r6 = f_lvlRegister(_fvgS,  _src, "FVG-", "BEAR", _srcTime, true, na(_fvgSTop) or na(_fvgSBot) ? 0.0 : math.abs(_fvgSTop - _fvgSBot) / 2.0)
+    if _new and array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            Lvl _v = array.get(levels, i)
+            if _v.src == _src
+                int _st = f_lvlStep(i, _h, _l, _c, _atrv, _srcTime, true)
+    int _done = 0
+
+// ---------------- CONFIRMED SWINGS (V4 core) ----------------
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,  pivLen, pivLen)
+
+// plotshape() demands a CONST size, so it cannot take a value derived from an
+// input. One gated call per size is the standard Pine workaround: exactly one
+// fires for the chosen setting, the rest evaluate false and draw nothing.
+plotshape(showTri and not na(ph) and structTriSz == "Tiny",   "Swing High", shape.triangledown, location.abovebar, color.new(color.gray, 25), size=size.tiny,   offset=-pivLen)
+plotshape(showTri and not na(ph) and structTriSz == "Small",  "Swing High S", shape.triangledown, location.abovebar, color.new(color.gray, 25), size=size.small,  offset=-pivLen)
+plotshape(showTri and not na(ph) and structTriSz == "Normal", "Swing High M", shape.triangledown, location.abovebar, color.new(color.gray, 25), size=size.normal, offset=-pivLen)
+plotshape(showTri and not na(ph) and structTriSz == "Large",  "Swing High L", shape.triangledown, location.abovebar, color.new(color.gray, 25), size=size.large,  offset=-pivLen)
+plotshape(showTri and not na(pl) and structTriSz == "Tiny",   "Swing Low",  shape.triangleup, location.belowbar, color.new(color.gray, 25), size=size.tiny,   offset=-pivLen)
+plotshape(showTri and not na(pl) and structTriSz == "Small",  "Swing Low S", shape.triangleup, location.belowbar, color.new(color.gray, 25), size=size.small,  offset=-pivLen)
+plotshape(showTri and not na(pl) and structTriSz == "Normal", "Swing Low M", shape.triangleup, location.belowbar, color.new(color.gray, 25), size=size.normal, offset=-pivLen)
+plotshape(showTri and not na(pl) and structTriSz == "Large",  "Swing Low L", shape.triangleup, location.belowbar, color.new(color.gray, 25), size=size.large,  offset=-pivLen)
+
+var float lastPH    = na
+var int   lastPHbar = na
+var float prevPH    = na
+var int   prevPHbar = na
+var float lastPL    = na
+var int   lastPLbar = na
+var float prevPL    = na
+var int   prevPLbar = na
+var bool  phBroken  = false
+var bool  plBroken  = false
+var int   lastHiCls = 0
+var int   lastLoCls = 0
+
+if not na(ph)
+    prevPH    := lastPH
+    prevPHbar := lastPHbar
+    lastPH    := ph
+    lastPHbar := bar_index - pivLen
+    phBroken  := false
+    string t = "H"
+    if not na(prevPH)
+        if math.abs(ph - prevPH) <= eqTolATR * atr
+            t := "EQH"
+            lastHiCls := 0
+        else if ph > prevPH
+            t := "HH"
+            lastHiCls := 1
+        else
+            t := "LH"
+            lastHiCls := -1
+    if showLbl
+        label.new(lastPHbar, ph, t, xloc.bar_index, yloc.abovebar, color.new(color.black, 100), label.style_label_down, f_structCol(t), f_structSz())
+    if t == "EQH"
+        locEqh := ph
+    if showPivLn
+        line _pvH = line.new(lastPHbar, ph, lastPHbar + pivLnLen, ph, xloc=xloc.bar_index, extend=pivLnExt ? extend.right : extend.none, color=f_structCol(t), width=pivLnW, style=f_pivSty())
+        array.push(pivLines, _pvH)
+        while array.size(pivLines) > pivLnMax
+            line _oldH = array.shift(pivLines)
+            line.delete(_oldH)
+
+if not na(pl)
+    prevPL    := lastPL
+    prevPLbar := lastPLbar
+    lastPL    := pl
+    lastPLbar := bar_index - pivLen
+    plBroken  := false
+    string t = "L"
+    if not na(prevPL)
+        if math.abs(pl - prevPL) <= eqTolATR * atr
+            t := "EQL"
+            lastLoCls := 0
+        else if pl < prevPL
+            t := "LL"
+            lastLoCls := -1
+        else
+            t := "HL"
+            lastLoCls := 1
+    if showLbl
+        label.new(lastPLbar, pl, t, xloc.bar_index, yloc.belowbar, color.new(color.black, 100), label.style_label_up, f_structCol(t), f_structSz())
+    if t == "EQL"
+        locEql := pl
+    if showPivLn
+        line _pvL = line.new(lastPLbar, pl, lastPLbar + pivLnLen, pl, xloc=xloc.bar_index, extend=pivLnExt ? extend.right : extend.none, color=f_structCol(t), width=pivLnW, style=f_pivSty())
+        array.push(pivLines, _pvL)
+        while array.size(pivLines) > pivLnMax
+            line _oldL = array.shift(pivLines)
+            line.delete(_oldL)
+
+// ---------------- BOS -> DEFINES THE LEG (V4 core, untouched) ----------------
+var int   legDir     = 0
+var float legAnchor  = na
+var int   legAnchorB = na
+var float legExt     = na
+var int   legExtB    = na
+var float bosLevel   = na
+var int   bosLevelB  = na
+var int   bosBreakB  = na
+var float lsLevel    = na
+var int   lsLevelB   = na
+
+bool newBos = false
+
+if not na(lastPL) and not plBroken and close < lastPL and not na(lastPH)
+    plBroken   := true
+    legDir     := -1
+    // Anchor = the true extreme between the last CONFIRMED swing high and the
+    // break bar. A high made after that pivot confirmed but before the BOS
+    // fired hasn't itself confirmed yet, so lastPH alone would anchor stale.
+    // Bounded window: the anchor can only move FORWARD to a more recent
+    // extreme, never back into older structure.
+    float aP = lastPH
+    int   aB = lastPHbar
+    int   aScan = math.min(bar_index - lastPHbar, 480)
+    for i = 0 to aScan
+        if high[i] > aP
+            aP := high[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPL
+    bosLevelB  := lastPLbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if not na(lastPH) and not phBroken and close > lastPH and not na(lastPL)
+    phBroken   := true
+    legDir     := 1
+    float aP = lastPL
+    int   aB = lastPLbar
+    int   aScan = math.min(bar_index - lastPLbar, 480)
+    for i = 0 to aScan
+        if low[i] < aP
+            aP := low[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPH
+    bosLevelB  := lastPHbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if newBos
+    int span = math.min(bar_index - legAnchorB, 480)
+    if legDir == -1
+        legExt  := low
+        legExtB := bar_index
+        for i = 0 to span
+            if low[i] < legExt
+                legExt  := low[i]
+                legExtB := bar_index - i
+    else
+        legExt  := high
+        legExtB := bar_index
+        for i = 0 to span
+            if high[i] > legExt
+                legExt  := high[i]
+                legExtB := bar_index - i
+
+    // ---- LIQUIDITY SWEEP (optional) ----
+    // Detection is DECOUPLED from the triangle system. Triangles stay sparse
+    // (pivLen) so the structure read stays clean, but sweeps are hunted against
+    // lighter "minor levels" (lsPivLen) — small highs/lows that never earned a
+    // label but still held liquidity. Nothing extra is drawn for them.
+    // A sweep = the origin's WICK exceeded such a level and price CLOSED back
+    // inside it (closes break, wicks sweep). First qualifying level walking
+    // BACK wins (most recent), search is bounded, so the marking can't wander.
+    lsLevel  := na
+    lsLevelB := na
+    if showLS
+        int   aOff   = math.max(0, bar_index - legAnchorB)
+        float aClose = close[aOff]
+        // runMax/runMin track the extreme of everything BETWEEN the candidate
+        // level and the origin. A level only counts if it was still STANDING
+        // when the origin raided it — if intervening price already traded
+        // through it, that liquidity was consumed and the level is dead.
+        float runMax = na
+        float runMin = na
+        for j = aOff + 1 to math.min(aOff + lsLookback, 450)
+            if na(high[j]) or j < lsPivLen
+                break
+            bool minorHi = true
+            bool minorLo = true
+            for w = 1 to lsPivLen
+                if na(high[j + w]) or na(high[j - w])
+                    minorHi := false
+                    minorLo := false
+                else
+                    if high[j] < high[j + w] or high[j] < high[j - w]
+                        minorHi := false
+                    if low[j] > low[j + w] or low[j] > low[j - w]
+                        minorLo := false
+            if legDir == -1 and minorHi
+                bool standing = na(runMax) or high[j] > runMax
+                bool took     = legAnchor > high[j] + lsMinPen * atr
+                bool failed   = lsMode == "Standing level taken" or aClose < high[j]
+                if standing and took and failed
+                    lsLevel  := high[j]
+                    lsLevelB := bar_index - j
+                    break
+            else if legDir == 1 and minorLo
+                bool standing = na(runMin) or low[j] < runMin
+                bool took     = legAnchor < low[j] - lsMinPen * atr
+                bool failed   = lsMode == "Standing level taken" or aClose > low[j]
+                if standing and took and failed
+                    lsLevel  := low[j]
+                    lsLevelB := bar_index - j
+                    break
+            runMax := na(runMax) ? high[j] : math.max(runMax, high[j])
+            runMin := na(runMin) ? low[j]  : math.min(runMin, low[j])
+
+if not newBos and legDir == -1 and not na(legExt) and low < legExt
+    legExt  := low
+    legExtB := bar_index
+if not newBos and legDir == 1 and not na(legExt) and high > legExt
+    legExt  := high
+    legExtB := bar_index
+
+// ---------------- DRAW ----------------
+var line  fl1   = na
+var line  fl0   = na
+var line  flOte = na
+var label lb1   = na
+var label lb0   = na
+var label lbOte = na
+var line  bosLn = na
+var label bosLb = na
+var line  lsLn  = na
+var label lsLb  = na
+var line  pocLn = na
+var array<box>   fvgB = array.new<box>()
+var array<label> fvgL = array.new<label>()
+// FVG 50% mid lines (additive)
+var array<line>  fvgMid = array.new<line>()
+f_fvgMidStyle() =>
+    fvgMidSty == "Solid" ? line.style_solid : fvgMidSty == "Dotted" ? line.style_dotted : line.style_dashed
+f_fvgMidExtend() =>
+    fvgMidExtM == "Right" ? extend.right : fvgMidExtM == "Left" ? extend.left : fvgMidExtM == "Both" ? extend.both : extend.none
+var array<box>   vpB  = array.new<box>()
+
+// confluence results computed during draw, used by the checklist
+// PHASE 15: the original engine's leg-scan FVG check. It runs only on the last
+// bar and feeds the DIAGNOSTICS table alone — it has no authority and cannot
+// reach GO. Kept because the reading is informative; explicitly not a third
+// truth source for any decision.
+bool fvgAtOte = false
+var bool  pocAtOte = false
+var float pocRatio = na
+// The volume profile is expensive (leg bars × intrabars × bins). barstate.islast
+// is true on EVERY realtime tick, so recomputing it per tick grows with the leg
+// until it trips Pine's execution limit. Rebuild once per bar instead.
+var int lastVpBar = na
+bool vpRebuild = na(lastVpBar) or lastVpBar != bar_index
+
+if barstate.islast
+    line.delete(fl1)
+    line.delete(fl0)
+    line.delete(flOte)
+    label.delete(lb1)
+    label.delete(lb0)
+    label.delete(lbOte)
+    line.delete(bosLn)
+    label.delete(bosLb)
+    line.delete(lsLn)
+    label.delete(lsLb)
+    while array.size(fvgB) > 0
+        box.delete(array.pop(fvgB))
+    while array.size(fvgL) > 0
+        label.delete(array.pop(fvgL))
+    while array.size(fvgMid) > 0
+        line.delete(array.pop(fvgMid))
+
+    if legDir != 0 and not na(legAnchor) and not na(legExt)
+        int   xEnd = bar_index + fibExtend
+        float ote  = legExt + oteLevel * (legAnchor - legExt)
+        float oteA = legExt + (oteLevel - oteTol) * (legAnchor - legExt)
+        float oteB = legExt + (oteLevel + oteTol) * (legAnchor - legExt)
+        float zHi  = math.max(oteA, oteB)
+        float zLo  = math.min(oteA, oteB)
+
+        if showFib
+            fl1   := line.new(legAnchorB, legAnchor, xEnd, legAnchor, xloc.bar_index, color=colFibLn, width=1)
+            fl0   := line.new(legAnchorB, legExt,    xEnd, legExt,    xloc.bar_index, color=colFibLn, width=1)
+            flOte := line.new(legAnchorB, ote,       xEnd, ote,       xloc.bar_index, color=colOte,   width=1)
+            lb1   := label.new(xEnd, legAnchor, "1", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lb0   := label.new(xEnd, legExt,    "0", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lbOte := label.new(xEnd, ote, str.tostring(oteLevel), xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colOte, size.small)
+
+        if showBosLn and not na(bosLevel)
+            bosLn := line.new(bosLevelB, bosLevel, bosBreakB, bosLevel, xloc.bar_index, color=colBos, width=1)
+            bosLb := label.new(math.round(math.avg(bosLevelB, bosBreakB)), bosLevel, "BOS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_up : label.style_label_down, colBos, size.tiny)
+
+        // liquidity sweep (only when present)
+        if showLS and not na(lsLevel)
+            lsLn := line.new(lsLevelB, lsLevel, legAnchorB, lsLevel, xloc.bar_index, color=colLSc, width=1)
+            lsLb := label.new(math.round(math.avg(lsLevelB, legAnchorB)), lsLevel, "LS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_down : label.style_label_up, colLSc, size.tiny)
+
+        // FVGs inside the leg + OTE confluence test
+        int span = math.min(bar_index - legAnchorB, 400)
+        if span >= 2
+            for i = 0 to span - 2
+                if na(high[i + 2])
+                    break
+                float t = na
+                float b = na
+                if legDir == 1 and low[i] > high[i + 2] and (low[i] - high[i + 2]) >= fvgMinATR * atr
+                    t := low[i]
+                    b := high[i + 2]
+                else if legDir == -1 and high[i] < low[i + 2] and (low[i + 2] - high[i]) >= fvgMinATR * atr
+                    t := low[i + 2]
+                    b := high[i]
+                if not na(t)
+                    if b <= zHi and t >= zLo
+                        fvgAtOte := true
+                    if showFVG
+                        int bx = bar_index - i - 1
+                        array.push(fvgB, box.new(bx, t, bx + fvgWidth, b, xloc=xloc.bar_index, border_color=color.new(colFvgBox, 60), border_width=1, bgcolor=colFvgBox))
+                        array.push(fvgL, label.new(bx + fvgWidth, math.avg(t, b), "FVG", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, color.new(color.gray, 30), size.tiny))
+                    // FVG 50% mid line — legDir 1 = bullish FVG (green), -1 = bearish (red)
+                    if showFvgMid
+                        int   bxm = bar_index - i - 1
+                        float fmid = math.avg(t, b)
+                        array.push(fvgMid, line.new(bxm, fmid, bxm + fvgWidth + fvgMidExt, fmid, xloc=xloc.bar_index, extend=f_fvgMidExtend(), color=f_fvgCol(legDir == 1, fmid), width=fvgMidW, style=f_fvgMidStyle()))
+
+        // ---- FIXED RANGE VOLUME PROFILE over the leg ----
+        // Rebuilt once per bar, not per tick (see vpRebuild above).
+        if vpMode == "On" and vpUsable and span >= 3 and vpRebuild
+            lastVpBar := bar_index
+            line.delete(pocLn)
+            while array.size(vpB) > 0
+                box.delete(array.pop(vpB))
+            float minL = math.min(legAnchor, legExt)
+            float maxH = math.max(legAnchor, legExt)
+            for j = 0 to span
+                minL := math.min(minL, low[j])
+                maxH := math.max(maxH, high[j])
+            float binH = (maxH - minL) / vpBins
+            if binH > 0
+                array<float> vols = array.new<float>(vpBins, 0.0)
+                for j = 0 to span
+                    array<float> aH = ltfH[j]
+                    array<float> aL = ltfL[j]
+                    array<float> aV = ltfV[j]
+                    bool usedIntra = false
+                    if not na(aH) and array.size(aH) > 0 and array.size(aH) == array.size(aL) and array.size(aH) == array.size(aV)
+                        usedIntra := true
+                        for q = 0 to array.size(aH) - 1
+                            float ih = array.get(aH, q)
+                            float il = array.get(aL, q)
+                            float iv = nz(array.get(aV, q))
+                            if iv > 0 and not na(ih) and not na(il)
+                                float irng = ih - il
+                                if irng <= 0
+                                    int bi = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    array.set(vols, bi, array.get(vols, bi) + iv)
+                                else
+                                    int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((ih - minL) / binH))))
+                                    for b = b0 to b1
+                                        float lo = minL + b * binH
+                                        float hi = lo + binH
+                                        float ov = math.min(ih, hi) - math.max(il, lo)
+                                        if ov > 0
+                                            array.set(vols, b, array.get(vols, b) + iv * ov / irng)
+                    if not usedIntra
+                        float bl = low[j]
+                        float bh = high[j]
+                        float v  = nz(volume[j])
+                        float rg = bh - bl
+                        if v > 0
+                            if rg <= 0
+                                int bi = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                array.set(vols, bi, array.get(vols, bi) + v)
+                            else
+                                int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((bh - minL) / binH))))
+                                for b = b0 to b1
+                                    float lo = minL + b * binH
+                                    float hi = lo + binH
+                                    float ov = math.min(bh, hi) - math.max(bl, lo)
+                                    if ov > 0
+                                        array.set(vols, b, array.get(vols, b) + v * ov / rg)
+
+                float maxV = 0.0
+                int   maxI = -1
+                for b = 0 to vpBins - 1
+                    if array.get(vols, b) > maxV
+                        maxV := array.get(vols, b)
+                        maxI := b
+
+                if maxI >= 0 and maxV > 0
+                    float poc = minL + (maxI + 0.5) * binH
+                    pocRatio := (poc - legExt) / (legAnchor - legExt)
+                    pocAtOte := math.abs(pocRatio - oteLevel) <= oteTol
+                    int anchorR = bar_index + vpOffset + vpWidth
+                    for b = 0 to vpBins - 1
+                        float bv = array.get(vols, b)
+                        if bv > 0
+                            int w = math.max(1, math.round(vpWidth * bv / maxV))
+                            float lo = minL + b * binH
+                            array.push(vpB, box.new(anchorR - w, lo + binH, anchorR, lo, xloc=xloc.bar_index, border_color=color.new(colVP, 100), bgcolor=b == maxI ? color.new(colPOC, 45) : colVP))
+                    pocLn := line.new(legAnchorB, poc, anchorR, poc, xloc.bar_index, color=colPOC, style=line.style_dashed, width=1)
+
+// ---------------- LEGACY CHECKLIST — DIAGNOSTICS ONLY (PHASE 9) -----------
+// This was one of the four competing brains. It is retained because the
+// individual readings are genuinely useful, but it has NO AUTHORITY: nothing
+// downstream reads it, and it can no longer produce or block a signal.
+//
+// Two defects are fixed rather than displayed, since a diagnostic that lies is
+// worse than no diagnostic:
+//
+//   D13 — the row labelled "BOS + FVG" displayed `hasLeg` alone. It never
+//         looked at the FVG at all, so it read ✓ on setups with no imbalance.
+//         `bosFvgOk` was computed correctly and then thrown away. Now used.
+//   D14 — `legDir` never resets to 0 after the first BOS, so `hasLeg` was
+//         permanently true and contributed a free point to every score from
+//         the first break onward. The row is dropped: a condition that is
+//         always true is not a condition, and the underlying variable is
+//         corrected in Phase 21 where the input contract is settled.
+//
+// The five-point score is GONE. It is replaced by the Decision Engine's own
+// state, shown as text so it cannot be mistaken for a competing tally.
+int structBias = lastHiCls == 1 and lastLoCls == 1 ? 1 : lastHiCls == -1 and lastLoCls == -1 ? -1 : 0
+
+var table t = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 25), border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast and showChk
+    color on  = color.new(color.lime, 0)
+    color off = color.new(color.gray, 45)
+    color txc = color.new(color.white, 10)
+
+    bool hasLeg   = legDir != 0
+    bool htfOk    = hasLeg and htfBias != 0 and ((legDir == 1) == (htfBias == 1))
+    bool bosFvgOk = hasLeg and fvgAtOte
+    bool lsOk     = hasLeg and not na(lsLevel)
+
+    string sTxt = structBias == 1 ? "BULLISH" : structBias == -1 ? "BEARISH" : "CONSOLIDATION"
+    color  sCol = structBias == 1 ? on : structBias == -1 ? color.new(color.red, 0) : color.new(color.orange, 0)
+    string hTxt = htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "—"
+
+    table.cell(t, 0, 0, "DIAGNOSTICS", text_color=txc, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 0, "no authority", text_color=off, text_size=size.tiny)
+
+    table.cell(t, 0, 1, "Chart structure", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 1, sTxt, text_color=sCol, text_size=size.tiny)
+
+    table.cell(t, 0, 2, "HTF " + biasTf + " aligned", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 2, hTxt + " " + (htfOk ? "✓" : "—"), text_color=htfOk ? on : off, text_size=size.tiny)
+
+    // D13 fixed: this row now shows what its label says
+    table.cell(t, 0, 3, "BOS + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 3, bosFvgOk ? "✓" : "—", text_color=bosFvgOk ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 4, str.tostring(oteLevel) + " + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 4, fvgAtOte ? "✓" : "—", text_color=fvgAtOte ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 5, "Liquidity sweep", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 5, lsOk ? "✓" : "—", text_color=lsOk ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 6, "POC @ " + str.tostring(oteLevel), text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    string pTxt = na(pocRatio) ? "—" : (pocAtOte ? "✓" : "—") + " (" + str.tostring(pocRatio, "#.##") + ")"
+    table.cell(t, 1, 6, pTxt, text_color=pocAtOte ? on : off, text_size=size.tiny)
+
+
+// ---------------- LOCAL (chart-TF) LEVELS INTO THE POOL --------------------
+// The engine's own BOS / LS / EQH / EQL / FVG are computed above; feed them in
+// as source "LOC" so confluence scoring and focus rank them alongside the MTF
+// levels instead of ignoring the timeframe you are actually looking at.
+// Their authority weight is the chart timeframe's own weight.
+var float locFvgBull = na
+var float locFvgBear = na
+// PHASE 5: gap edges latched for the lifecycle, exactly as f_fvgMids does
+var float locFvgBullTop = na
+var float locFvgBullBot = na
+var float locFvgBearTop = na
+var float locFvgBearBot = na
+// PHASE 15: same shared rule as every other source — LOC is a source, not a
+// special case with its own definition of what a gap is
+[_lbM, _lbT, _lbB, _lsM2, _lsT2, _lsB2] = f_fvgRaw(atr)
+if not na(_lbM)
+    locFvgBull    := _lbM
+    locFvgBullTop := _lbT
+    locFvgBullBot := _lbB
+if not na(_lsM2)
+    locFvgBear    := _lsM2
+    locFvgBearTop := _lsT2
+    locFvgBearBot := _lsB2
+
+// only draw a source TF when it is at least as large as the chart TF
+int   chartSec  = timeframe.in_seconds(timeframe.period)
+bool  showW_ok  = useTfW  and timeframe.in_seconds("W")   >= chartSec
+bool  showD_ok  = useTfD  and timeframe.in_seconds("D")   >= chartSec
+bool  show4H_ok = useTf4H and timeframe.in_seconds("240") >= chartSec
+bool  show1H_ok = useTf1H and timeframe.in_seconds("60")  >= chartSec
+bool  show15_ok = useTf15 and timeframe.in_seconds("15")  >= chartSec
+bool  show2D_ok = useTf2D and timeframe.in_seconds("2D")  >= chartSec
+bool  show30_ok = useTf30 and timeframe.in_seconds("30")  >= chartSec
+bool  show5_ok  = useTf5  and timeframe.in_seconds("5")   >= chartSec
+bool  show3M_ok = useTf3M and timeframe.in_seconds("3M")  >= chartSec
+bool  showM_ok  = useTfM  and timeframe.in_seconds("M")   >= chartSec
+
+// ── PHASE 4 · LOC / FIXED-SOURCE COLLISION ────────────────────────────────
+// Because every gate above is `>= chartSec`, a chart sitting exactly on one of
+// the ten fixed source TFs enables that source AND injects the identical series
+// again as LOC. locCanon names the fixed source LOC actually is; locDup is true
+// only when that source is genuinely live in the pool.
+//
+// Per-type gating needs no extra work: the fixed slot for type T exists iff
+// `show<TF>_ok and showT`, and the LOC slot iff `showT`. Whenever locDup holds,
+// `show<TF>_ok` is true, so both conditions reduce to `showT` — one flag covers
+// every type. Same for the FVG pair.
+string locCanon = f_srcCanon("LOC")
+bool   locDup   = locCanon == "3M" ? show3M_ok : locCanon == "1M" ? showM_ok : locCanon == "W" ? showW_ok : locCanon == "2D" ? show2D_ok : locCanon == "D" ? showD_ok : locCanon == "4H" ? show4H_ok : locCanon == "1H" ? show1H_ok : locCanon == "30m" ? show30_ok : locCanon == "15m" ? show15_ok : locCanon == "5m" ? show5_ok : false
+
+
+// ── PHASE 8 · FIXED-SOURCE INGEST ─────────────────────────────────────────
+// One call per source. Each registers whatever that source currently publishes
+// and then steps every level it owns against its newly confirmed bar.
+//
+// Note what is NOT here: any notion of the chart timeframe. The gates above
+// decide which sources are REQUESTED; nothing below decides which levels
+// survive, rank, or update. That is the Brain/Visual split — the registry is
+// built identically whatever chart you are on, and only drawing differs.
+f_ingest("W", bosPxW, bosDirW, eqhPxW, eqlPxW, lsPxW, lsDirW, fvgBullW, fvgBullTopW, fvgBullBotW, fvgBearW, fvgBearTopW, fvgBearBotW, srcHW, srcLW, srcCW, srcAtrW, srcTW, showW_ok)
+f_ingest("D", bosPxD, bosDirD, eqhPxD, eqlPxD, lsPxD, lsDirD, fvgBullD, fvgBullTopD, fvgBullBotD, fvgBearD, fvgBearTopD, fvgBearBotD, srcHD, srcLD, srcCD, srcAtrD, srcTD, showD_ok)
+f_ingest("4H", bosPx4H, bosDir4H, eqhPx4H, eqlPx4H, lsPx4H, lsDir4H, fvgBull4H, fvgBullTop4H, fvgBullBot4H, fvgBear4H, fvgBearTop4H, fvgBearBot4H, srcH4H, srcL4H, srcC4H, srcAtr4H, srcT4H, show4H_ok)
+f_ingest("1H", bosPx1H, bosDir1H, eqhPx1H, eqlPx1H, lsPx1H, lsDir1H, fvgBull1H, fvgBullTop1H, fvgBullBot1H, fvgBear1H, fvgBearTop1H, fvgBearBot1H, srcH1H, srcL1H, srcC1H, srcAtr1H, srcT1H, show1H_ok)
+f_ingest("15m", bosPx15, bosDir15, eqhPx15, eqlPx15, lsPx15, lsDir15, fvgBull15, fvgBullTop15, fvgBullBot15, fvgBear15, fvgBearTop15, fvgBearBot15, srcH15, srcL15, srcC15, srcAtr15, srcT15, show15_ok)
+f_ingest("2D", bosPx2D, bosDir2D, eqhPx2D, eqlPx2D, lsPx2D, lsDir2D, fvgBull2D, fvgBullTop2D, fvgBullBot2D, fvgBear2D, fvgBearTop2D, fvgBearBot2D, srcH2D, srcL2D, srcC2D, srcAtr2D, srcT2D, show2D_ok)
+f_ingest("30m", bosPx30, bosDir30, eqhPx30, eqlPx30, lsPx30, lsDir30, fvgBull30, fvgBullTop30, fvgBullBot30, fvgBear30, fvgBearTop30, fvgBearBot30, srcH30, srcL30, srcC30, srcAtr30, srcT30, show30_ok)
+f_ingest("5m", bosPx5, bosDir5, eqhPx5, eqlPx5, lsPx5, lsDir5, fvgBull5, fvgBullTop5, fvgBullBot5, fvgBear5, fvgBearTop5, fvgBearBot5, srcH5, srcL5, srcC5, srcAtr5, srcT5, show5_ok)
+f_ingest("3M", bosPx3M, bosDir3M, eqhPx3M, eqlPx3M, lsPx3M, lsDir3M, fvgBull3M, fvgBullTop3M, fvgBullBot3M, fvgBear3M, fvgBearTop3M, fvgBearBot3M, srcH3M, srcL3M, srcC3M, srcAtr3M, srcT3M, show3M_ok)
+f_ingest("1M", bosPxM, bosDirM, eqhPxM, eqlPxM, lsPxM, lsDirM, fvgBullM, fvgBullTopM, fvgBullBotM, fvgBearM, fvgBearTopM, fvgBearBotM, srcHM, srcLM, srcCM, srcAtrM, srcTM, showM_ok)
+
+// ── PHASE 8 · LOCAL SOURCE INGEST ─────────────────────────────────────────
+// LOC's source IS the chart, so its "confirmed source bar" is the chart's own
+// confirmed bar and its OHLC is the chart's OHLC. Going through the exact same
+// f_ingest() path as every fixed source is the point: local levels are not a
+// special case with parallel rules that can drift, they are one more source.
+int locSrcTime = barstate.isconfirmed ? time : na
+f_ingest("LOC", bosLevel, legDir == 1 ? 1 : -1, locEqh, locEql, lsLevel, legDir == 1 ? 1 : -1, locFvgBull, locFvgBullTop, locFvgBullBot, locFvgBear, locFvgBearTop, locFvgBearBot, high, low, close, atr, locSrcTime, localInPool and not locDup)
+
+// ── PHASE 8 · DRAW PASS (VISIBILITY ONLY) ─────────────────────────────────
+// Runs after every source has been ingested. Selects what to RENDER; it does
+// not and cannot change registry state. Selection is by authority so that when
+// the draw budget binds, it is the lowest-authority levels that go unrendered —
+// the Brain still holds and scores all of them.
+if barstate.islast and array.size(levels) > 0
+    int _budget = lvlDrawMax
+    // pass 1: live levels, highest authority first
+    for _rank = 0 to 9
+        float _wantW = _rank == 0 ? 10.0 : _rank == 1 ? 8.0 : _rank == 2 ? 6.0 : _rank == 3 ? 5.0 : _rank == 4 ? 4.0 : _rank == 5 ? 3.0 : _rank == 6 ? 2.0 : _rank == 7 ? 1.5 : _rank == 8 ? 1.0 : 0.5
+        for i = 0 to array.size(levels) - 1
+            Lvl _d = array.get(levels, i)
+            bool _live = f_lifeAuth(_d.typ, _d.life) > 0.0
+            if f_tfWeight(_d.src) == _wantW and (_live or lvlDrawDead) and _budget > 0
+                int _dd = f_lvlDraw(i, mtfOn and f_lvlTypeVisible(_d.typ))
+                _budget -= 1
+    // pass 2: anything not selected is explicitly undrawn, so a level dropping
+    // out of the budget cannot leave an orphaned line behind
+    for i = 0 to array.size(levels) - 1
+        Lvl _u = array.get(levels, i)
+        bool _liveU = f_lifeAuth(_u.typ, _u.life) > 0.0
+        if not na(_u.ln) and not (_liveU or lvlDrawDead)
+            int _du = f_lvlDraw(i, false)
+
+// PHASE 4 diagnostics. `LOC dedup active` reads 1 on exactly those chart TFs
+// that coincide with a fixed source, and the pool size is then lower by the
+// number of LOC slots that would have been duplicates.
+plot(f_srcSec(locCanon),  "LOC canonical TF (s)", display = display.data_window)
+plot(locDup ? 1 : 0,      "LOC dedup active (1/0)", display = display.data_window)
+plot(array.size(levels), "MTF pool size", display = display.data_window)
+
+// PHASE 5 diagnostics. `live` counts levels still carrying authority; the gap
+// between the two is the dead evidence that used to be steering decisions.
+int lifeLive = 0
+if array.size(levels) > 0
+    for i = 0 to array.size(levels) - 1
+        Lvl _lc = array.get(levels, i)
+        if f_lifeAuth(_lc.typ, _lc.life) > 0.0
+            lifeLive += 1
+plot(lifeLive, "Levels with authority", display = display.data_window)
+plot(array.size(levels) - lifeLive, "Levels dead (zero authority)", display = display.data_window)
+
+// ── PHASE 8 · PARITY DIAGNOSTICS ──────────────────────────────────────────
+// The plan's exit gate is a parity MATRIX, so the Data Window has to publish
+// per-source raw values that can be compared across charts by reading them off
+// rather than by eyeballing lines. Every number below is derived only from
+// source data, so each must be IDENTICAL on every chart timeframe where that
+// source is valid. Any difference is a parity failure by definition.
+f_regCount(string _src) =>
+    int _c = 0
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            Lvl _r = array.get(levels, i)
+            if _r.src == _src
+                _c += 1
+    _c
+
+f_regLive(string _src) =>
+    int _c = 0
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            Lvl _r = array.get(levels, i)
+            if _r.src == _src and f_lifeAuth(_r.typ, _r.life) > 0.0
+                _c += 1
+    _c
+
+// newest registered BOS price per source — the value the parity matrix compares
+f_regNewest(string _src, string _typ) =>
+    float _px = na
+    int   _b  = -1
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            Lvl _r = array.get(levels, i)
+            if _r.src == _src and _r.typ == _typ and _r.birth > _b
+                _b  := _r.birth
+                _px := _r.px
+    _px
+
+plot(f_regNewest("W",  "BOS"), "PARITY W BOS px",  display = display.data_window)
+plot(f_regNewest("D",  "BOS"), "PARITY D BOS px",  display = display.data_window)
+plot(f_regNewest("4H", "BOS"), "PARITY 4H BOS px", display = display.data_window)
+plot(f_regNewest("1H", "BOS"), "PARITY 1H BOS px", display = display.data_window)
+plot(f_regNewest("30m","BOS"), "PARITY 30m BOS px", display = display.data_window)
+plot(f_regNewest("15m","BOS"), "PARITY 15m BOS px", display = display.data_window)
+plot(f_regNewest("5m", "BOS"), "PARITY 5m BOS px", display = display.data_window)
+plot(f_regCount("W"),  "PARITY W registry count",  display = display.data_window)
+plot(f_regLive("W"),   "PARITY W live count",      display = display.data_window)
+plot(f_regCount("D"),  "PARITY D registry count",  display = display.data_window)
+plot(f_regLive("D"),   "PARITY D live count",      display = display.data_window)
+plot(f_regCount("4H"), "PARITY 4H registry count", display = display.data_window)
+plot(f_regLive("4H"),  "PARITY 4H live count",     display = display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE DECISION ENGINE — PHASES 10, 11, 12
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 9 requires exactly ONE path that can produce GO. Everything below is
+// that path. Everything outside it — the old five-point checklist, focus mode,
+// the confluence tags — is diagnostics or cosmetics with no authority, and is
+// marked as such where it lives.
+//
+//   PHASE 10  direction   what is the market actually doing
+//   PHASE 11  location    which single level are we trading against
+//   PHASE 12  lock        commit to that level so it cannot become a moving target
+//
+// Each stage consumes only the stage above it. There is no second opinion.
+
+// ── PHASE 10 · MARKET DIRECTION ───────────────────────────────────────────
+// Macro regime is a 2-of-3 vote across W, D and 4H TRUE STRUCTURE — not BOS
+// event direction, which is a memory of something that happened once and can
+// stay bullish through an entire bearish leg.
+//
+// 1H is deliberately NOT a macro vote. It is alignment context for execution:
+// useful for timing, far too fast to define the regime.
+int macroBull = (srcStructW == 1 ? 1 : 0) + (srcStructD == 1 ? 1 : 0) + (srcStruct4H == 1 ? 1 : 0)
+int macroBear = (srcStructW == -1 ? 1 : 0) + (srcStructD == -1 ? 1 : 0) + (srcStruct4H == -1 ? 1 : 0)
+int macroDir  = macroBull >= 2 ? 1 : macroBear >= 2 ? -1 : 0
+string macroTxt = macroDir == 1 ? "BULLISH" : macroDir == -1 ? "BEARISH" : "MIXED"
+
+// BOS event direction is preserved SEPARATELY, as metadata. It is still useful
+// — it says what the last structural break was — but it is never a substitute
+// for regime and nothing downstream may read it as one.
+int lastBosDir = legDir
+
+// 1H alignment: context for the timing stage, not a vote here
+bool h1Aligned = macroDir != 0 and srcStruct1H == macroDir
+
+// ── PHASE 11 · ONE LOCATION ENGINE ────────────────────────────────────────
+// The single place a tradeable level is chosen. Execution used to run its own
+// raw scan over the level array while focus mode ran a different one, so the
+// chart could hide a level that execution was simultaneously trading against.
+// Both are gone; this publishes one selection and everything references it.
+//
+// Eligibility is directional: for a LONG we want a floor BELOW price that is
+// bullish and alive. A bearish level cannot be a long's support just because
+// it happens to sit underneath.
+f_locEligible(int _i, int _dir) =>
+    Lvl _e = array.get(levels, _i)
+    bool _live  = f_lifeAuth(_e.typ, _e.life) > 0.0
+    bool _side  = _dir == 1 ? _e.px < close : _e.px > close
+    bool _dirOk = _dir == 1 ? _e.dir == "BULL" : _e.dir == "BEAR"
+    _live and _side and _dirOk and f_tfWeight(_e.src) >= locMinW
+
+// Confluence score for one level, reusing the Phase 7 rules verbatim so the
+// engine and the chart cannot disagree about what a level is worth.
+f_locScore(int _i) =>
+    Lvl _a = array.get(levels, _i)
+    float _sc = f_tfWeight(_a.src) * f_lifeAuth(_a.typ, _a.life)
+    string _seen = "|" + f_srcCanon(_a.src) + "|"
+    bool _conf = false
+    if array.size(levels) > 0
+        for j = 0 to array.size(levels) - 1
+            if j != _i
+                Lvl _b = array.get(levels, j)
+                if math.abs(_b.px - _a.px) <= f_pairTol(_a.src, _b.src)
+                    if not f_dirCompat(_a.dir, _b.dir)
+                        _conf := true
+                    if f_dirCompat(_a.dir, _b.dir)
+                        string _bc = f_srcCanon(_b.src)
+                        bool _dup = str.contains(_seen, "|" + _bc + "|")
+                        bool _same = _dup and _b.typ == _a.typ
+                        _sc += _same ? 0.0 : f_tfWeight(_b.src) * (_dup ? conflSameTfMult : 1.0) * f_lifeAuth(_b.typ, _b.life)
+                        if not _dup
+                            _seen := _seen + _bc + "|"
+    [_sc, _conf]
+
+// The published selection. Every field the plan names, one source of truth.
+var int    selId      = 0
+var float  selPrice   = na
+var string selSource  = ""
+var string selType    = ""
+var string selDir     = ""
+var int    selLife    = 0
+var float  selAuth    = 0.0
+var float  selConfl   = 0.0
+var float  selDist    = na
+var int    selTouch   = 0
+var int    selHold    = 0
+var int    selBreak   = 0
+var bool   selConflict = false
+var float  selInval   = na
+var int    selRank    = 0
+var float  nearOppose = na
+
+// Rejection reasons for the top candidates, so "why did this win" is
+// answerable rather than asserted. Cleared and rebuilt each evaluation.
+var array<string> locWhy = array.new<string>()
+
+// ── PHASE 11 · LOCATION SELECTION (INLINED) ───────────────────────────────
+// COMPILER-COMPATIBILITY (CE10088). This was `f_runLocation(int _dir)`, which
+// published the selection by assigning the sel* globals. Pine forbids that
+// from inside a function. It had exactly ONE call site, so the body now runs
+// at global scope where those assignments are legal.
+//
+// Statement-for-statement identical, in the same order, with `_dir` bound to
+// its only ever argument, `macroDir`. Nothing that reads sel* changed. The
+// partial reset in the `_best < 0` branch is preserved deliberately: it is the
+// frozen behaviour, and 'improving' it here would be a semantic change.
+array.clear(locWhy)
+int   _best   = -1
+float _bestSc = -1.0
+int   _cands  = 0
+if macroDir != 0 and array.size(levels) > 0
+    for i = 0 to array.size(levels) - 1
+        Lvl _c = array.get(levels, i)
+        bool _ok = f_locEligible(i, macroDir)
+        if _ok
+            _cands += 1
+            [_sc, _cf] = f_locScore(i)
+            float _d = math.abs(_c.px - close)
+            bool _reach = _d <= locMaxDistATR * atr
+            // A contested price is refused outright. Phase 7 could only
+            // tag it; the location engine is where that tag has to bite,
+            // because this is the level a stop would be placed behind.
+            if _cf and locRejectConflict
+                if array.size(locWhy) < 6
+                    array.push(locWhy, _c.src + " " + _c.typ + " @" + str.tostring(_c.px, format.mintick) + " — CONFLICT")
+            if not _reach
+                if array.size(locWhy) < 6
+                    array.push(locWhy, _c.src + " " + _c.typ + " — too far (" + str.tostring(_d / atr, "#.#") + " ATR)")
+            if _reach and not (_cf and locRejectConflict)
+                if _sc > _bestSc
+                    _bestSc := _sc
+                    _best   := i
+                if _sc <= _bestSc and array.size(locWhy) < 6
+                    array.push(locWhy, _c.src + " " + _c.typ + " — lower score (" + str.tostring(_sc, "#.#") + ")")
+if _best >= 0
+    Lvl _w = array.get(levels, _best)
+    [_wsc, _wcf] = f_locScore(_best)
+    selId      := _w.id
+    selPrice   := _w.px
+    selSource  := _w.src
+    selType    := _w.typ
+    selDir     := _w.dir
+    selLife    := _w.life
+    selAuth    := f_tfWeight(_w.src)
+    selConfl   := _wsc
+    selDist    := math.abs(_w.px - close)
+    selTouch   := _w.touches
+    selHold    := _w.holds
+    selBreak   := _w.breaks
+    selConflict := _wcf
+    // invalidation is a property of the LEVEL, published here so the risk
+    // engine cannot invent its own
+    selInval   := macroDir == 1 ? _w.px - execStopBuf * f_srcAtr(_w.src) : _w.px + execStopBuf * f_srcAtr(_w.src)
+    selRank    := _cands
+if _best < 0
+    selId := 0
+    selPrice := na
+    selSource := ""
+    selType := ""
+    selDir := ""
+    selConfl := 0.0
+    selInval := na
+    selRank := 0
+// nearest OPPOSING level: the first thing in the way, and the natural target
+float _opp = na
+float _oppD = 1.0e18
+if array.size(levels) > 0
+    for i = 0 to array.size(levels) - 1
+        Lvl _o = array.get(levels, i)
+        bool _liveO = f_lifeAuth(_o.typ, _o.life) > 0.0
+        bool _ahead = macroDir == 1 ? _o.px > close : _o.px < close
+        if _liveO and _ahead and f_tfWeight(_o.src) >= locMinW
+            float _od = math.abs(_o.px - close)
+            if _od < _oppD
+                _oppD := _od
+                _opp  := _o.px
+nearOppose := _opp
+
+int locBest = _best
+
+
+// ── PHASE 12 · SETUP LOCK ─────────────────────────────────────────────────
+// Without this the setup is a moving target: rankings shift as price travels,
+// so the level a sweep refers to may not be the level that was defended when
+// the approach began. Timing events must reference ONE immutable location.
+//
+// SCANNING → WATCHING → APPROACHING → LOCKED
+// Once locked, no other candidate can steal the setup. It releases only on
+// GO, hard invalidation, timeout, or macro conflict — never because something
+// else started scoring higher.
+var int    lockState = 0            // 0 SCANNING 1 WATCHING 2 APPROACHING 3 LOCKED
+var int    lockId    = 0
+var float  lockPrice = na
+var string lockSrc   = ""
+var string lockType  = ""
+var int    lockDir   = 0
+var int    lockBar   = na
+var float  lockInval = na
+var string lockWhy   = ""
+
+f_lockName(int _s) =>
+    _s == 0 ? "SCANNING" : _s == 1 ? "WATCHING" : _s == 2 ? "APPROACHING" : "LOCKED"
+
+// Does the locked level still exist, unchanged, and still alive? Identity is
+// immutable (Phase 8), so this is an exact ID lookup — the level cannot have
+// quietly become a different price under the same name.
+f_lockAlive() =>
+    bool _ok = false
+    if lockId != 0 and array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            Lvl _k = array.get(levels, i)
+            if _k.id == lockId
+                _ok := f_lifeAuth(_k.typ, _k.life) > 0.0
+                break
+    _ok
+
+if barstate.isconfirmed
+    int _s0 = lockState
+    bool _haveDir = macroDir != 0
+    bool _haveLoc = locBest >= 0 and not na(selPrice)
+    bool _rankOk  = _haveLoc and selConfl >= lockMinScore
+    bool _approach = _haveLoc and not na(selDist) and selDist <= lockApproachATR * atr
+
+    // release conditions, evaluated before advancement
+    bool _macroConflict = lockState == 3 and lockDir != 0 and macroDir != 0 and macroDir != lockDir
+    bool _hardInval = lockState == 3 and not na(lockInval) and (lockDir == 1 ? close < lockInval : close > lockInval)
+    bool _timeout   = lockState == 3 and not na(lockBar) and (bar_index - lockBar) > lockMaxBars
+    bool _gone      = lockState == 3 and not f_lockAlive()
+
+    if _s0 == 3 and (_macroConflict or _hardInval or _timeout or _gone)
+        lockState := 0
+        lockId    := 0
+        lockPrice := na
+        lockDir   := 0
+        lockWhy   := _macroConflict ? "macro flipped" : _hardInval ? "invalidated" : _timeout ? "timed out" : "level died"
+    if _s0 < 3
+        if not _haveDir
+            lockState := 0
+            lockWhy   := "no macro direction"
+        if _haveDir and not _rankOk
+            lockState := 1
+            lockWhy   := "watching — no candidate above threshold"
+        if _haveDir and _rankOk and not _approach
+            lockState := 2
+            lockWhy   := "approaching — price not yet in band"
+        if _haveDir and _rankOk and _approach
+            lockState := 3
+            lockId    := selId
+            lockPrice := selPrice
+            lockSrc   := selSource
+            lockType  := selType
+            lockDir   := macroDir
+            lockBar   := bar_index
+            lockInval := selInval
+            lockWhy   := "locked"
+
+// ---------------- EXEC MODE: hide MTF drawings (slots keep computing) -------
+// Execution mode strips the MAP but keeps the local read: LOC slots (this
+// chart's own BOS / LS / EQH / EQL / FVG) stay drawn as extended lines, only
+// the higher-timeframe levels are blanked. The slots all keep syncing either
+// way, because the entry rules below still read them.
+if execOn and barstate.islast and array.size(levels) > 0
+    for i = 0 to array.size(levels) - 1
+        Lvl _hs = array.get(levels, i)
+        // PHASE 4: "local" is now a CANONICAL test. When locDup holds there is
+        // no LOC slot at all — the chart's own series lives in the pool under
+        // its real TF tag (e.g. "30m" on a 30m chart), and that is the slot
+        // execution mode must keep. Comparing against the literal string "LOC"
+        // would blank the chart's own levels on exactly those timeframes.
+        if f_srcCanon(_hs.src) != locCanon or not execKeepLocal
+            line.set_color(_hs.ln, color.new(color.white, 100))
+            if not na(_hs.lb)
+                label.delete(_hs.lb)
+                _hs.lb := na
+                array.set(levels, i, _hs)
+
+// ---------------- CONFLUENCE PASS ----------------
+// Runs AFTER every slot has synced, so it decorates the finished set. Only on
+// the last bar: these lines extend both ways, so only their current appearance
+// matters, and this keeps the O(n²) scan off every historical bar.
+// A group = same event type, prices within tolerance, different source TFs.
+// The lowest-index member is "primary" and carries the merged tag; the rest
+// give up their label so one clean tag replaces a stack of them.
+if conflOn and not execOn and barstate.islast and array.size(levels) > 0
+    // PHASE 7: the chart-ATR tolerance that used to live here is gone —
+    // proximity is now decided per PAIR by f_pairTol(), at the source scale.
+    for i = 0 to array.size(levels) - 1
+        Lvl _a = array.get(levels, i)
+        // PHASE 6: the retrospective f_levelRecord() scan that used to run here
+        // is GONE. It walked backwards through chart bars around today's price,
+        // counting interactions from before the level existed and returning a
+        // different answer on every chart timeframe. _a.holds / _a.breaks are now
+        // filled by f_syncSlot from the source-owned prospective memory, so
+        // this loop reads them rather than recomputing them.
+        string  _tags     = _a.src
+        // delimiter-wrapped list of source TFs already counted in this group,
+        // so "|D|" cannot accidentally match inside "|2D|".
+        // PHASE 4: keyed on CANONICAL identity. The pool-level suppression above
+        // already prevents a LOC/fixed pair from co-existing, but this loop is
+        // where double counting would actually be paid out, so it does not
+        // depend on that upstream guarantee — it re-derives identity itself.
+        string  _seen     = "|" + f_srcCanon(_a.src) + "|"
+        int     _n        = 1     // levels inside the zone, compatible or not
+        int     _nCompat  = 1     // levels that actually AGREE — the real count
+        bool    _primary  = true
+        bool    _sameType = true
+        bool    _corr     = false
+        bool    _conflict = false
+        // PHASE 5: authority is gated by lifecycle. A level whose state says it
+        // has been broken / swept / filled / retired contributes 0 — both as a
+        // group member and as the group's own seed — so dead evidence cannot
+        // reach the score threshold, the focus filter or the tag.
+        float   _aAuth    = f_lifeAuth(_a.typ, _a.life)
+        float   _selfAuth = f_tfWeight(_a.src) * _aAuth
+        float   _score    = _selfAuth
+        for j = 0 to array.size(levels) - 1
+            if j != i
+                Lvl _b = array.get(levels, j)
+                bool _typeOk = conflCrossType or _b.typ == _a.typ
+                // PHASE 7 component 6: proximity judged at the SOURCE scale of
+                // the wider of the two, not the chart's.
+                if _typeOk and math.abs(_b.px - _a.px) <= f_pairTol(_a.src, _b.src)
+                    _n += 1
+                    string _bCanon = f_srcCanon(_b.src)
+                    bool _dupTf = str.contains(_seen, "|" + _bCanon + "|")
+                    // Same canonical TF, SAME type = literally the same logical
+                    // event seen twice: it contributes nothing extra. Same TF,
+                    // DIFFERENT type is real but correlated, so it keeps the
+                    // conflSameTfMult discount and flags the group as correlated.
+                    bool _sameEvent = _dupTf and _b.typ == _a.typ
+                    // PHASE 7 component 4: DIRECTION COMPATIBILITY.
+                    // An opposing level is the market disagreeing at this price.
+                    // It contributes nothing — never negative, because the plan
+                    // says "never extra agreement", not "penalise" — and it
+                    // marks the cluster CONFLICT so the disagreement is stated
+                    // rather than silently averaged away.
+                    bool _compat = f_dirCompat(_a.dir, _b.dir)
+                    if not _compat
+                        _conflict := true
+                    if _compat
+                        _nCompat += 1
+                        _score += _sameEvent ? 0.0 : f_tfWeight(_b.src) * (_dupTf ? conflSameTfMult : 1.0) * f_lifeAuth(_b.typ, _b.life)
+                        if _dupTf
+                            _corr := true
+                        if not _dupTf
+                            _seen := _seen + _bCanon + "|"
+                            if j > i
+                                _tags := _tags + "+" + _b.src
+                        if _b.typ != _a.typ
+                            _sameType := false
+                        // PHASE 7: the CANONICAL HIGHER-AUTHORITY identity owns
+                        // the cluster's representation. Previously the lowest
+                        // array index carried the merged tag, which is an
+                        // artefact of insertion order — a 5m level could end up
+                        // speaking for a group containing a Weekly one. Ties
+                        // fall back to index so the choice stays deterministic.
+                        float _oAuth = f_tfWeight(_b.src) * f_lifeAuth(_b.typ, _b.life)
+                        if _oAuth > _selfAuth
+                            _primary := false
+                        if _oAuth == _selfAuth and j < i
+                            _primary := false
+        // track record folds in as a multiplier when enabled
+        if scFold
+            _score := _score * f_provenMult(_a.holds, _a.breaks)
+        // record suffix for the tag: (holds/tests), blank when never tested
+        // PHASE 6: prospective counts accrued since birth, so an empty record
+        // genuinely means "not tested yet" rather than "not found in the
+        // lookback window".
+        string _rec = scOn and (_a.holds + _a.breaks) > 0 ? " (" + str.tostring(_a.holds) + "/" + str.tostring(_a.holds + _a.breaks) + ")" : ""
+        // PHASE 7: decoration keys on COMPATIBLE agreement, not raw occupancy.
+        // A level with three opposing neighbours is not a confluence cluster.
+        if _nCompat > 1
+            line.set_width(_a.ln, conflW)
+            if conflUseCol
+                line.set_color(_a.ln, conflCol)
+            if conflMergeLbl and not na(_a.lb) and _primary
+                // "~" marks a group whose members are not fully independent:
+                // at least two share one canonical timeframe. The score already
+                // discounts them; the tag says so out loud.
+                // "CONFLICT" marks a price where compatible evidence agrees but
+                // opposing evidence is also present — worth knowing before
+                // trading it, and invisible under the old raw-proximity model.
+                string _base = (_sameType ? _tags + " " + _a.typ : _tags + " MULTI") + (_corr ? "~" : "") + (_conflict ? " ⚠CONFLICT" : "")
+                label.set_text(_a.lb, (conflShowScore ? _base + " ★" + str.tostring(_score, "#.#") : _base) + _rec)
+            if conflMergeLbl and not na(_a.lb) and not _primary
+                label.delete(_a.lb)
+                _a.lb := na
+                array.set(levels, i, _a)
+        // lone levels: still score them, so the filter below can rank everything.
+        // A level whose only neighbours oppose it lands here — correctly, since
+        // nothing agrees with it — but still says so.
+        if _nCompat == 1 and conflShowScore and not na(_a.lb)
+            label.set_text(_a.lb, _a.src + " " + _a.typ + (_conflict ? " ⚠CONFLICT" : "") + " ★" + str.tostring(_score, "#.#") + _rec)
+        // authority filter — hide anything the market does not sufficiently agree on.
+        // Line is made transparent rather than deleted so the slot stays intact
+        // and the next bar's sync does not have to rebuild it.
+        if conflMinScore > 0 and _score < conflMinScore
+            line.set_color(_a.ln, color.new(color.white, 100))
+            if not na(_a.lb)
+                label.delete(_a.lb)
+                _a.lb := na
+                array.set(levels, i, _a)
+
+// ---------------- FOCUS PASS — COSMETIC ONLY (PHASE 9) --------------------
+// Focus decides what is DRAWN. It has no authority: the Decision Engine runs
+// its own location selection over the full registry and never consults this
+// pass, so putting a level to sleep here cannot stop the engine trading it and
+// cannot make the engine trade something it otherwise would not.
+// Runs AFTER confluence so it decorates the already-scored set. Finds the
+// nearest QUALIFYING level above price and the nearest below, then hides
+// everything that is not one of them (or confluent with one of them).
+// Score = authority, distance = relevance; focus needs both.
+if focusOn and not execOn and barstate.islast and array.size(levels) > 0
+    float _bestAboveD = 1.0e18
+    int   _bestAboveI = -1
+    float _bestBelowD = 1.0e18
+    int   _bestBelowI = -1
+    // rank: re-derive each level's score, then keep the closest on each side
+    for i = 0 to array.size(levels) - 1
+        Lvl _s = array.get(levels, i)
+        // PHASE 5: same lifecycle gate as the confluence pass. The focus pass
+        // re-derives its own score, so it must apply the gate itself or a dead
+        // level could still be picked as one of the two focus lines.
+        float  _sc    = f_tfWeight(_s.src) * f_lifeAuth(_s.typ, _s.life)
+        // PHASE 4: canonical identity here too — this loop re-derives the score
+        // independently of the confluence pass, so it must dedupe identically
+        // or focus and confluence would disagree about the same level.
+        string _fseen = "|" + f_srcCanon(_s.src) + "|"
+        for j = 0 to array.size(levels) - 1
+            if j != i
+                Lvl _o = array.get(levels, j)
+                bool _tok = conflCrossType or _o.typ == _s.typ
+                // PHASE 7: identical rules to the confluence pass — source-
+                // normalized proximity and direction compatibility. If focus
+                // used a different definition of "agrees", the two views would
+                // rank the same level differently.
+                if _tok and math.abs(_o.px - _s.px) <= f_pairTol(_s.src, _o.src) and f_dirCompat(_s.dir, _o.dir)
+                    string _oCanon = f_srcCanon(_o.src)
+                    bool _fdup  = str.contains(_fseen, "|" + _oCanon + "|")
+                    bool _fSame = _fdup and _o.typ == _s.typ
+                    _sc += _fSame ? 0.0 : f_tfWeight(_o.src) * (_fdup ? conflSameTfMult : 1.0) * f_lifeAuth(_o.typ, _o.life)
+                    if not _fdup
+                        _fseen := _fseen + _oCanon + "|"
+        if scFold
+            _sc := _sc * f_provenMult(_s.holds, _s.breaks)
+        // ── PHASE 8 · THE FRESHNESS GATE IS GONE (D6) ────────────────────
+        // Two gates now, not three: AUTHORITY (score) and REACH (distance).
+        //
+        // The removed third gate demoted levels for being old. Under the old
+        // moving-latch model that was at least coherent — `moved` tracked when
+        // the latch last jumped. Under permanent membership it is simply wrong:
+        // a Weekly BOS that has stood unbroken for eight months is the
+        // STRONGEST line on the chart, not the stalest. Age is not decay.
+        //
+        // Whether a level is still worth trading is answered by its LIFECYCLE,
+        // which is measured from what price actually did to it, and that gate
+        // is already applied above via f_lifeAuth(). Recency added nothing
+        // except a bias against exactly the structure this engine exists to
+        // find — which is why focus mode was returning zero levels on charts
+        // where execution mode had a full set.
+        float _dist    = math.abs(_s.px - close)
+        bool  _reachOk = _dist <= focusMaxDistATR * atr
+        if _sc >= focusMinScore and _reachOk
+            float _d = _s.px - close
+            if _d > 0 and _d < _bestAboveD
+                _bestAboveD := _d
+                _bestAboveI := i
+            if _d <= 0 and (-_d) < _bestBelowD
+                _bestBelowD := -_d
+                _bestBelowI := i
+    // say WHY when nothing qualifies, instead of silently blanking the chart
+    var label focusWhy = na
+    label.delete(focusWhy)
+    if _bestAboveI < 0 and _bestBelowI < 0
+        focusWhy := label.new(bar_index + 3, close, "FOCUS: no level passes\nscore ≥ " + str.tostring(focusMinScore, "#.#") + " · within " + str.tostring(focusMaxDistATR, "#") + " ATR", xloc.bar_index, yloc.price, color.new(color.orange, 20), label.style_label_left, color.white, size.small)
+
+    // hide everything outside the keeper set
+    for i = 0 to array.size(levels) - 1
+        Lvl _s2 = array.get(levels, i)
+        bool _keep = false
+        // PHASE 7: the keeper set uses the same source-normalized pair
+        // tolerance as the scoring loops, so "confluent with a focus line"
+        // means the same thing everywhere.
+        if _bestAboveI >= 0
+            Lvl _kA = array.get(levels, _bestAboveI)
+            if math.abs(_s2.px - _kA.px) <= f_pairTol(_s2.src, _kA.src)
+                _keep := true
+        if _bestBelowI >= 0
+            Lvl _kB = array.get(levels, _bestBelowI)
+            if math.abs(_s2.px - _kB.px) <= f_pairTol(_s2.src, _kB.src)
+                _keep := true
+        if not _keep
+            line.set_color(_s2.ln, color.new(color.white, 100))
+            if not na(_s2.lb)
+                label.delete(_s2.lb)
+                _s2.lb := na
+                array.set(levels, i, _s2)
+
+// ---------------- PHASE 3 · CANONICAL STATE DEBUG TABLE --------------------
+// Proves the model carries meaning rather than just a price: TF | TYPE | PRICE
+// | DIR | ROLE | STATE. Read-only — it consumes canonical state and never
+// writes it, so toggling it cannot alter any decision.
+var table dbgT = table.new(position.middle_left, 7, 41, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 75))
+if dbgOn and barstate.islast
+    table.clear(dbgT, 0, 0, 6, 40)
+    color _dh = color.new(color.silver, 0)
+    table.cell(dbgT, 0, 0, "TF",    text_color=_dh, text_size=size.tiny)
+    table.cell(dbgT, 1, 0, "TYPE",  text_color=_dh, text_size=size.tiny)
+    table.cell(dbgT, 2, 0, "PRICE", text_color=_dh, text_size=size.tiny)
+    table.cell(dbgT, 3, 0, "DIR",   text_color=_dh, text_size=size.tiny)
+    table.cell(dbgT, 4, 0, "ROLE",  text_color=_dh, text_size=size.tiny)
+    table.cell(dbgT, 5, 0, "STATE", text_color=_dh, text_size=size.tiny)
+    table.cell(dbgT, 6, 0, "MEMORY", text_color=_dh, text_size=size.tiny)
+    // order by |distance to price| when requested, else pool order
+    array<int> _ord = array.new<int>()
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            array.push(_ord, i)
+        // size > 1 is mandatory, not defensive: `for a = 0 to size - 2` with a
+        // single element becomes `0 to -1`, which Pine iterates DOWNWARD, and
+        // the body then reads _ord[b + 1] past the end.
+        if dbgNear and array.size(_ord) > 1
+            for a = 0 to array.size(_ord) - 2
+                for b = 0 to array.size(_ord) - 2 - a
+                    Lvl _x = array.get(levels, array.get(_ord, b))
+                    Lvl _y = array.get(levels, array.get(_ord, b + 1))
+                    if math.abs(_x.px - close) > math.abs(_y.px - close)
+                        int _t = array.get(_ord, b)
+                        array.set(_ord, b, array.get(_ord, b + 1))
+                        array.set(_ord, b + 1, _t)
+    int _shown = math.min(array.size(_ord), dbgRows)
+    if _shown > 0
+        for r = 0 to _shown - 1
+            Lvl _d = array.get(levels, array.get(_ord, r))
+            color _dc = _d.dir == "BULL" ? color.new(#26a69a, 0) : _d.dir == "BEAR" ? color.new(#ef5350, 0) : color.new(color.gray, 0)
+            table.cell(dbgT, 0, r + 1, _d.src, text_color=color.new(color.white, 20), text_size=size.tiny)
+            table.cell(dbgT, 1, r + 1, _d.typ, text_color=color.new(color.white, 20), text_size=size.tiny)
+            table.cell(dbgT, 2, r + 1, str.tostring(_d.px, format.mintick), text_color=color.new(color.white, 20), text_size=size.tiny)
+            table.cell(dbgT, 3, r + 1, _d.dir, text_color=_dc, text_size=size.tiny)
+            table.cell(dbgT, 4, r + 1, _d.role, text_color=color.new(color.white, 35), text_size=size.tiny)
+            // PHASE 5: dead states are shown in red so a spent level is
+            // obvious at a glance rather than needing the code to interpret.
+            bool _dLive = f_lifeAuth(_d.typ, _d.life) > 0.0
+            table.cell(dbgT, 5, r + 1, f_lifeName(_d.typ, _d.life), text_color=_dLive ? color.new(color.white, 35) : color.new(#ef5350, 0), text_size=size.tiny)
+            // PHASE 6: prospective memory, accrued since this level was born.
+            // "M0 UNTESTED" here is a fact about the level, not a lookback limit.
+            string _dm = f_memState(_d.touches) + (_d.touches > 0 ? "  " + str.tostring(_d.holds) + "H/" + str.tostring(_d.breaks) + "B" : "")
+            table.cell(dbgT, 6, r + 1, _dm, text_color=color.new(color.white, 35), text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXECUTION MODE — five independent conditions, all computed EVERY BAR
+// ═══════════════════════════════════════════════════════════════════════════
+// Deliberately avoids fvgAtOte / pocAtOte: the engine only computes those
+// inside barstate.islast (the volume profile is far too costly per bar), which
+// would make the whole rule set unreviewable on history. Everything below is
+// global-scope and non-repainting, so triggers plot on past bars and the rules
+// can be judged instead of trusted.
+//
+//   1 BIAS      HTF structure agrees with the leg's direction
+//   2 LOCATION  price is AT a level carrying enough authority   <- ties the
+//               level engine to the entry rules
+//   3 TRIGGER   the BOS that defined this leg is RECENT (kills the old
+//               "hasLeg" freebie, which was true forever after the first BOS)
+//   4 CONFIRM   the leg's origin swept liquidity
+//   5 R:R       reward to the opposing level beats the profile's minimum
+// ═══════════════════════════════════════════════════════════════════════════
+
+// profile resolvers — same rules, three risk appetites
+f_pMinLvl()  => execProfile == "Scalp" ? 2.0 : execProfile == "Swing" ? 4.0 : execProfile == "Position" ? 8.0 : cMinLvl
+f_pAtLvl()   => execProfile == "Scalp" ? 0.5 : execProfile == "Swing" ? 1.0 : execProfile == "Position" ? 1.5 : cAtLvl
+f_pBosAge()  => execProfile == "Scalp" ? 20  : execProfile == "Swing" ? 50  : execProfile == "Position" ? 100 : cBosAge
+f_pMinRR()   => execProfile == "Scalp" ? 1.5 : execProfile == "Swing" ? 2.0 : execProfile == "Position" ? 3.0 : cMinRR
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 13 · LIQUIDITY SEMANTICS — TWO DIFFERENT THINGS, TWO DIFFERENT NAMES
+// ═══════════════════════════════════════════════════════════════════════════
+// The word "sweep" was doing two jobs. A user seeing SWEEP ✓ reasonably assumes
+// the entry trigger has fired — but the variable behind it was the LEG sweep,
+// which is historical context about how the current leg began and may be
+// hundreds of bars old and hundreds of points away.
+//
+//   LEG SWEEP    historical evidence. `lsLevel` / the LS registry levels.
+//                Says how this leg started. Never a trigger.
+//   ENTRY SWEEP  an attack on the EXACT LOCKED LEVEL from the defended side,
+//                which then fails. Only meaningful after a lock exists.
+//
+// They are now separately named, and the entry sequence can only ever read the
+// second one.
+var float entrySweepExt = na      // the extreme of the sweep — Phase 16 stops use this
+var int   entrySweepBar = na
+var bool  entrySweep    = false
+
+entrySweep := false
+if barstate.isconfirmed and lockState == 3 and not na(lockPrice)
+    float _swTol = timeSweepATR * atr
+    // LONG: price wicks BELOW the defended level and closes back above it.
+    // The close is what makes it a failed attack rather than a break.
+    bool _swLong  = lockDir ==  1 and low  < lockPrice - _swTol and close > lockPrice
+    bool _swShort = lockDir == -1 and high > lockPrice + _swTol and close < lockPrice
+    if _swLong or _swShort
+        entrySweep    := true
+        entrySweepExt := _swLong ? low : high
+        entrySweepBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 14 · TIMING STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════
+// A score threshold is not an entry sequence. Location says WHERE; this says
+// WHEN, and only through deterministic price action on confirmed bars.
+//
+//   LOCKED → ENTRY_SWEEP → RECLAIM → MSS → DISPLACEMENT → ARMED → GO
+//
+// No stage may be skipped. Every transition is single-step over a frozen
+// snapshot, the same discipline as the lifecycle machines.
+// 0 IDLE  1 SWEPT  2 RECLAIMED  3 MSS  4 DISPLACED  5 ARMED
+var int   timeState = 0
+var float timeSweepX = na       // sweep extreme
+var float timeReclaim = na      // level reclaimed
+var float timeMss    = na       // the swing broken to confirm the shift
+var int   timeBar    = na       // bar the sequence last advanced
+var string timeWhy   = ""
+
+f_timeName(int _s) =>
+    _s == 0 ? "IDLE" : _s == 1 ? "SWEPT" : _s == 2 ? "RECLAIMED" : _s == 3 ? "MSS" : _s == 4 ? "DISPLACED" : "ARMED"
+
+// The micro-swing the reclaim must break to count as a market structure shift.
+// Deliberately small and local: this is a timing event on the chart timeframe,
+// not a structural break on a higher one.
+var float mssHigh = na
+var float mssLow  = na
+if barstate.isconfirmed
+    float _mh = ta.pivothigh(high, timeMssPiv, timeMssPiv)
+    float _ml = ta.pivotlow(low,  timeMssPiv, timeMssPiv)
+    if not na(_mh)
+        mssHigh := _mh
+    if not na(_ml)
+        mssLow := _ml
+
+if barstate.isconfirmed
+    int _t0 = timeState
+    bool _haveLock = lockState == 3
+    // any of these resets the whole sequence — a timing sequence that outlives
+    // its setup is meaningless
+    bool _tTimeout = not na(timeBar) and (bar_index - timeBar) > timeMaxBars
+    bool _tLost    = not _haveLock
+
+    if _tLost or _tTimeout
+        timeState := 0
+        timeWhy   := _tLost ? "lock lost" : "timing timeout"
+    if not _tLost and not _tTimeout
+        // 0 -> 1 the locked level is attacked and defends
+        if _t0 == 0 and entrySweep
+            timeState  := 1
+            timeSweepX := entrySweepExt
+            timeBar    := bar_index
+            timeWhy    := "entry sweep on the locked level"
+        // 1 -> 2 price reclaims the level decisively
+        if _t0 == 1
+            bool _rec = lockDir == 1 ? close > lockPrice + timeReclaimATR * atr : close < lockPrice - timeReclaimATR * atr
+            bool _swFail = lockDir == 1 ? close < timeSweepX : close > timeSweepX
+            if _swFail
+                timeState := 0
+                timeWhy   := "sweep extreme broken — not a sweep, a break"
+            if _rec and not _swFail
+                timeState   := 2
+                timeReclaim := lockPrice
+                timeBar     := bar_index
+                timeWhy     := "reclaimed"
+        // 2 -> 3 market structure shift: the local counter-swing breaks
+        if _t0 == 2
+            bool _mss = lockDir == 1 ? (not na(mssHigh) and close > mssHigh) : (not na(mssLow) and close < mssLow)
+            bool _swFail2 = lockDir == 1 ? close < timeSweepX : close > timeSweepX
+            if _swFail2
+                timeState := 0
+                timeWhy   := "invalidated below the sweep extreme"
+            if _mss and not _swFail2
+                timeState := 3
+                timeMss   := lockDir == 1 ? mssHigh : mssLow
+                timeBar   := bar_index
+                timeWhy   := "market structure shift"
+        // 3 -> 4 displacement: the shift must be delivered with intent, not drift
+        if _t0 == 3
+            float _rng = high - low
+            bool _disp = _rng >= timeDispATR * atr and (lockDir == 1 ? close > open : close < open)
+            if _disp
+                timeState := 4
+                timeBar   := bar_index
+                timeWhy   := "displacement confirmed"
+        // 4 -> 5 armed
+        if _t0 == 4
+            timeState := 5
+            timeBar   := bar_index
+            timeWhy   := "armed"
+        // 5 stays armed until it fires or the lock releases
+        if _t0 == 5
+            timeWhy := "armed"
+
+// ── PHASE 9/11 · EXECUTION CONSUMES THE ENGINE ────────────────────────────
+// What used to live here: an independent raw scan over the level array, its own
+// notion of "nearest qualifying level", its own bias test against htfBias, and
+// a six-condition score. That was a second brain. It could — and did — trade
+// against a level the chart was simultaneously hiding.
+//
+// It is gone. Execution now reads the Decision Engine's published selection and
+// nothing else. There is no path from here back into the level array.
+int   exDir    = lockState == 3 ? lockDir : macroDir
+float exLevel  = lockState == 3 ? lockPrice : selPrice
+// ── PHASE 16 · RISK FROM THE LOCKED SETUP ─────────────────────────────────
+// "Nearest line + ATR buffer" could place a stop behind a level that was not
+// defending anything. The stop now comes from the setup that actually exists:
+//   sweep entry     -> beyond the SWEEP EXTREME, which is where the market
+//                      proved it would not go
+//   non-sweep model -> beyond the locked level's published invalidation
+// Both use the LOCKED level's own source ATR for the buffer, so a Weekly setup
+// gets a Weekly-scaled stop rather than a chart-scaled one.
+float exStopBuffer = execStopBuf * (lockState == 3 and lockSrc != "" ? f_srcAtr(lockSrc) : atr)
+float exStop   = lockState == 3 and not na(timeSweepX) and timeState >= 1 ? (lockDir == 1 ? timeSweepX - exStopBuffer : timeSweepX + exStopBuffer) : lockState == 3 ? lockInval : selInval
+float exTarget = nearOppose
+float exRisk   = na(exStop)   or na(exLevel) ? na : math.abs(close - exStop)
+float exRew    = na(exTarget) ? na : math.abs(exTarget - close)
+float exRR     = na(exRisk) or na(exRew) or exRisk <= 0 ? 0.0 : exRew / exRisk
+
+// Diagnostic breakdown of the ONE decision. These are readouts of engine state,
+// not independent votes — nothing below is summed into a score that could
+// disagree with the engine.
+// PHASE 21: exHasDir and exAtLevel were removed here. Both became dead when
+// Phase 14 moved GO behind the timing machine — "price is near the level" is
+// now implied by the entry sweep having fired ON that level, so a separate
+// proximity test was answering a question nothing asked.
+bool exHasLoc  = not na(exLevel)
+bool exLocked  = lockState == 3
+bool exRRok    = exRR >= f_pMinRR()
+bool exAligned = h1Aligned
+
+// ── PHASE 9 · THE SINGLE GO PATH ──────────────────────────────────────────
+// Exactly one place in this script can produce GO. Phase 14 adds the timing
+// sequence in front of it; Phase 16 refines the risk gate. Nothing else may
+// ever set these two variables.
+bool goLong  = false
+bool goShort = false
+// PHASE 14: GO requires the timing sequence to have reached ARMED. Location
+// alone can no longer fire — that was the defect (D9), a score threshold
+// standing in for an entry sequence.
+bool goArmed = execOn and exLocked and exRRok and timeState == 5
+if goArmed and exDir == 1
+    goLong := true
+if goArmed and exDir == -1
+    goShort := true
+
+bool exReady = goLong or goShort
+bool exLong  = goLong
+bool exShort = goShort
+
+// historical + live triggers (const sizes — plotshape demands them)
+plotshape(execOn and execMarks and exLong  and not exLong[1],  "Exec Long",  shape.triangleup,   location.belowbar, color.new(#26a69a, 0), size=size.small)
+plotshape(execOn and execMarks and exShort and not exShort[1], "Exec Short", shape.triangledown, location.abovebar, color.new(#ef5350, 0), size=size.small)
+bgcolor(execOn and execTint and exReady ? color.new(exDir == 1 ? color.green : color.red, 90) : na, title="Execution Ready")
+
+var label exFlag = na
+if execOn and barstate.islast
+    label.delete(exFlag)
+    if exReady and execLbl
+        exFlag := label.new(bar_index + 3, close, (exDir == 1 ? "LONG " : "SHORT ") + lockSrc + " " + lockType + "  " + str.tostring(exRR, "#.#") + "R", xloc.bar_index, yloc.price, exDir == 1 ? color.new(#26a69a, 0) : color.new(#ef5350, 0), label.style_label_left, color.white, size.normal)
+
+// ── PHASE 9/11/12 · ENGINE READOUT ────────────────────────────────────────
+// This table is a WINDOW ONTO THE ENGINE, not a parallel scorecard. Every row
+// displays a field the engine published. There is no total, because a total
+// invites the reader to add it up differently from the engine — which is how
+// the script came to have four brains in the first place.
+var table exT = table.new(position.bottom_right, 2, 10, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.new(color.gray, 70))
+if execOn and execTable and barstate.islast
+    color _yes = color.new(color.lime, 0)
+    color _no  = color.new(color.gray, 45)
+    color _tx  = color.new(color.white, 10)
+    table.cell(exT, 0, 0, execProfile, text_color=_tx, text_size=size.small, text_halign=text.align_left)
+    table.cell(exT, 1, 0, f_lockName(lockState), text_color=exLocked ? _yes : _tx, text_size=size.small)
+    table.cell(exT, 0, 1, "Macro (W/D/4H)", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 1, macroTxt + " " + str.tostring(math.max(macroBull, macroBear)) + "/3", text_color=macroDir != 0 ? _yes : _no, text_size=size.tiny)
+    table.cell(exT, 0, 2, "1H aligned", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 2, exAligned ? "OK" : "—", text_color=exAligned ? _yes : _no, text_size=size.tiny)
+    table.cell(exT, 0, 3, "Location", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 3, exHasLoc ? selSource + " " + selType : "—", text_color=exHasLoc ? _yes : _no, text_size=size.tiny)
+    table.cell(exT, 0, 4, "Level ★", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 4, exHasLoc ? str.tostring(selConfl, "#.#") + (selConflict ? " ⚠" : "") : "—", text_color=exHasLoc ? _yes : _no, text_size=size.tiny)
+    table.cell(exT, 0, 5, "Record (H/T)", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 5, selTouch > 0 ? str.tostring(selHold) + "/" + str.tostring(selTouch) : "untested", text_color=_tx, text_size=size.tiny)
+    // PHASE 13: named ENTRY sweep, so it cannot be misread as the leg sweep
+    table.cell(exT, 0, 6, "Timing", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 6, f_timeName(timeState), text_color=timeState == 5 ? _yes : timeState > 0 ? _tx : _no, text_size=size.tiny)
+    table.cell(exT, 0, 8, "Entry sweep", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 8, timeState >= 1 ? "YES @" + str.tostring(timeSweepX, format.mintick) : "— (leg sweep is not this)", text_color=timeState >= 1 ? _yes : _no, text_size=size.tiny)
+    table.cell(exT, 0, 7, "R:R ≥ " + str.tostring(f_pMinRR(), "#.#"), text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 7, str.tostring(exRR, "#.#") + (exRRok ? " OK" : ""), text_color=exRRok ? _yes : _no, text_size=size.tiny)
+    table.cell(exT, 0, 9, "Stop / Target", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(exT, 1, 9, (na(exStop) ? "—" : str.tostring(exStop, format.mintick)) + " / " + (na(exTarget) ? "—" : str.tostring(exTarget, format.mintick)), text_color=_tx, text_size=size.tiny)
+
+alertcondition(exLong  and not exLong[1],  "EXEC LONG",  "SWINGTECH execution: all conditions met, long")
+alertcondition(exShort and not exShort[1], "EXEC SHORT", "SWINGTECH execution: all conditions met, short")
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNAL TRACKER — walk-forward outcome measurement
+// ═══════════════════════════════════════════════════════════════════════════
+// Every trigger is stored with the stop and target that were known AT ENTRY,
+// then resolved only by LATER bars. Nothing here looks ahead, and nothing is
+// filtered by whether it won — the point is to find out, not to flatter.
+// Wins pay their planned R, losses pay -1R, timeouts pay whatever they are
+// actually worth when closed.
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 22 · COCKPIT — READ-ONLY
+// ═══════════════════════════════════════════════════════════════════════════
+// Cosmetics come after logic. This layer READS state and never writes it: every
+// value below is a published engine field, and nothing here is assigned to any
+// variable the engine reads back. Toggling it off cannot move a GO bar, which
+// is a structural property, not a promise.
+//
+// ACTION names the FIRST BLOCKER, in the order the engine actually evaluates
+// them. That ordering matters: telling someone "waiting for MSS" when the real
+// problem is that there is no macro direction sends them to watch the wrong
+// thing.
+ckOn   = input.bool(true, "Show cockpit", group="Cockpit")
+ckPos  = input.string("Top left", "Position", options=["Top left","Top center","Middle left","Bottom center"], group="Cockpit")
+ckSize = input.string("Small", "Text size", options=["Tiny","Small","Normal"], group="Cockpit")
+
+f_ckPos() =>
+    ckPos == "Top left" ? position.top_left : ckPos == "Top center" ? position.top_center : ckPos == "Middle left" ? position.middle_left : position.bottom_center
+
+f_ckSz() =>
+    ckSize == "Tiny" ? size.tiny : ckSize == "Small" ? size.small : size.normal
+
+// First blocker, evaluated in engine order. Note that INVALIDATED is checked
+// before everything else: if the setup has just died, that is the news.
+f_ckAction() =>
+    string _a = "WAIT · SCAN"
+    if macroDir == 0
+        _a := "WAIT · DIRECTION"
+    if macroDir != 0 and na(selPrice)
+        _a := "WAIT · LOCATION"
+    if macroDir != 0 and not na(selPrice) and selConfl < lockMinScore
+        _a := "WAIT · RANK"
+    if macroDir != 0 and not na(selPrice) and selConfl >= lockMinScore and lockState < 3
+        _a := "WAIT · LOCK"
+    if lockState == 3 and timeState == 0
+        _a := "WAIT · SWEEP"
+    if lockState == 3 and timeState == 1
+        _a := "WAIT · RECLAIM"
+    if lockState == 3 and timeState == 2
+        _a := "WAIT · MSS"
+    if lockState == 3 and timeState == 3
+        _a := "WAIT · DISPLACEMENT"
+    if lockState == 3 and timeState == 4
+        _a := "WAIT · ARM"
+    if lockState == 3 and timeState == 5 and not exRRok
+        _a := "WAIT · RISK"
+    if goLong
+        _a := "GO LONG"
+    if goShort
+        _a := "GO SHORT"
+    if lockState == 0 and (lockWhy == "invalidated" or lockWhy == "macro flipped" or lockWhy == "level died")
+        _a := "INVALIDATED · " + lockWhy
+    _a
+
+var table ck = table.new(position.top_left, 2, 9, bgcolor=color.new(color.black, 12), border_width=1, border_color=color.new(color.gray, 60))
+if ckOn and barstate.islast
+    table.set_position(ck, f_ckPos())
+    color _l = color.new(color.silver, 15)
+    color _v = color.new(color.white, 0)
+    color _g = color.new(#26a69a, 0)
+    color _r = color.new(#ef5350, 0)
+    color _w = color.new(color.orange, 0)
+
+    string _act = f_ckAction()
+    color  _actCol = str.startswith(_act, "GO") ? _g : str.startswith(_act, "INVALIDATED") ? _r : _w
+
+    string _struct = (srcStructW == 1 ? "W↑" : srcStructW == -1 ? "W↓" : "W~") + " " + (srcStructD == 1 ? "D↑" : srcStructD == -1 ? "D↓" : "D~") + " " + (srcStruct4H == 1 ? "4H↑" : srcStruct4H == -1 ? "4H↓" : "4H~")
+
+    // Regime and last-BOS shown together and labelled differently on purpose:
+    // when they disagree, that disagreement is the single most useful thing on
+    // this panel, and the old engine hid it by conflating them.
+    table.cell(ck, 0, 0, "BIAS", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    string _bosTxt = lastBosDir == 1 ? "BOS↑" : lastBosDir == -1 ? "BOS↓" : "BOS—"
+    table.cell(ck, 1, 0, macroTxt + " · " + _struct + "  (" + _bosTxt + ")", text_color=macroDir == 1 ? _g : macroDir == -1 ? _r : _w, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 1, "LOCATION", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    string _loc = na(selPrice) ? "—" : selSource + " " + selType + " " + (lockState == 3 ? "· LOCKED ✓" : "· " + f_lockName(lockState))
+    table.cell(ck, 1, 1, _loc, text_color=lockState == 3 ? _g : _v, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 2, "PRICE", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    table.cell(ck, 1, 2, na(selPrice) ? "—" : str.tostring(selPrice, format.mintick) + (na(selDist) ? "" : "  (" + str.tostring(selDist / atr, "#.#") + " ATR)"), text_color=_v, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 3, "MEMORY", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    table.cell(ck, 1, 3, na(selPrice) ? "—" : f_memState(selTouch) + (selTouch > 0 ? " · " + str.tostring(selTouch) + " TESTS / " + str.tostring(selHold) + " HOLDS" : ""), text_color=_v, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 4, "RANK", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    table.cell(ck, 1, 4, na(selPrice) ? "—" : str.tostring(selConfl, "#.#") + "/" + str.tostring(lockMinScore, "#.#") + (selConfl >= lockMinScore ? " ✓" : "") + (selConflict ? "  ⚠CONFLICT" : ""), text_color=selConfl >= lockMinScore ? _g : _v, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 5, "ENTRY SWEEP", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    table.cell(ck, 1, 5, timeState >= 1 ? "✓ @" + str.tostring(timeSweepX, format.mintick) : "—", text_color=timeState >= 1 ? _g : _v, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 6, "RECLAIM", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    table.cell(ck, 1, 6, timeState >= 2 ? "✓" : timeState == 1 ? "WAIT" : "—", text_color=timeState >= 2 ? _g : _v, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 7, "MSS / DISP", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    table.cell(ck, 1, 7, timeState >= 4 ? "✓" : timeState == 3 ? "MSS ✓ · DISP WAIT" : timeState == 2 ? "WAIT" : "—", text_color=timeState >= 4 ? _g : _v, text_size=f_ckSz(), text_halign=text.align_left)
+
+    table.cell(ck, 0, 8, "ACTION", text_color=_l, text_size=f_ckSz(), text_halign=text.align_left)
+    table.cell(ck, 1, 8, _act, text_color=_actCol, text_size=f_ckSz(), text_halign=text.align_left)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASES 17 + 18 · OBSERVER AND TRACKER
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 17 — promising ideas contaminate a core if they are given weight before
+// they have earned it. Everything recorded below is OBSERVATIONAL: it is
+// snapshotted at lock, measured after the fact, and read by nothing that can
+// influence GO. The A/B property the plan asks for is structural — no field
+// written here is read by the Decision Engine, so toggling the display cannot
+// move a signal by construction, not by inspection.
+//
+// PHASE 18 — D12: the legacy "6/6 subset" divided by wins + losses while the
+// main population divided by wins + losses + timeouts, so the two numbers were
+// never comparable and the subset always looked better. Every setup now carries
+// exactly ONE status and every statistic states its denominator.
+//
+//   OPEN · WIN · LOSS · TIMEOUT
+//
+var array<float> trE  = array.new<float>()   // entry
+var array<float> trS  = array.new<float>()   // stop
+var array<float> trT  = array.new<float>()   // target
+var array<int>   trD  = array.new<int>()     // direction
+var array<float> trR  = array.new<float>()   // planned R
+var array<int>   trC  = array.new<int>()     // confluence score at entry
+var array<int>   trB  = array.new<int>()     // entry bar
+var array<float> trMF = array.new<float>()   // MFE in R, running
+var array<float> trMA = array.new<float>()   // MAE in R, running
+// PHASE 17 observer snapshot, taken at entry and never read by the engine
+var array<float> trOA = array.new<float>()   // authority of the traded level
+var array<int>   trOT = array.new<int>()     // memory: touches at entry
+var array<int>   trOH = array.new<int>()     // memory: holds at entry
+
+var int   trWin   = 0
+var int   trLoss  = 0
+var int   trTime  = 0        // TIMEOUT — its own status, never folded into a win rate silently
+var float trSumR  = 0.0
+var float trSumW  = 0.0      // R from wins only, for average win
+var float trSumL  = 0.0      // R from losses only
+var float trBestMF = 0.0
+var float trWorstMA = 0.0
+var int   trConsL = 0
+var int   trMaxConsL = 0
+var int   trLastBar = -99999
+
+// ---- resolve open trades on this bar (entry bar itself is never used) ----
+if trackOn and array.size(trE) > 0
+    int _i = array.size(trE) - 1
+    while _i >= 0
+        float _te = array.get(trE, _i)
+        float _ts = array.get(trS, _i)
+        float _tt = array.get(trT, _i)
+        int   _td = array.get(trD, _i)
+        float _tr = array.get(trR, _i)
+        int   _tb = array.get(trB, _i)
+        float _risk = math.abs(_te - _ts)
+        bool  _done = false
+        if bar_index > _tb and _risk > 0
+            // PHASE 17: excursions, measured in R so they are comparable across
+            // symbols and setups
+            float _mfe = (_td == 1 ? high - _te : _te - low) / _risk
+            float _mae = (_td == 1 ? _te - low : high - _te) / _risk
+            if _mfe > array.get(trMF, _i)
+                array.set(trMF, _i, _mfe)
+            if _mae > array.get(trMA, _i)
+                array.set(trMA, _i, _mae)
+
+            bool _hitS = _td == 1 ? low <= _ts : high >= _ts
+            bool _hitT = _td == 1 ? high >= _tt : low <= _tt
+            // both touched in one bar: assume the stop went first (conservative)
+            if _hitS
+                trWin += 0
+                trLoss += 1
+                trSumR -= 1.0
+                trSumL -= 1.0
+                trConsL += 1
+                if trConsL > trMaxConsL
+                    trMaxConsL := trConsL
+                _done := true
+            if _hitT and not _hitS
+                trWin += 1
+                trSumR += _tr
+                trSumW += _tr
+                trConsL := 0
+                _done := true
+            if (not _done) and (bar_index - _tb) >= trMaxBars
+                float _rz = (close - _te) * _td / _risk
+                trTime += 1
+                trSumR += _rz
+                // a timeout is NOT a loss and NOT a win. It does not touch the
+                // consecutive-loss streak, because it is not a loss.
+                _done  := true
+        if _done
+            float _fm = array.get(trMF, _i)
+            float _fa = array.get(trMA, _i)
+            if _fm > trBestMF
+                trBestMF := _fm
+            if _fa > trWorstMA
+                trWorstMA := _fa
+            array.remove(trE, _i)
+            array.remove(trS, _i)
+            array.remove(trT, _i)
+            array.remove(trD, _i)
+            array.remove(trR, _i)
+            array.remove(trC, _i)
+            array.remove(trB, _i)
+            array.remove(trMF, _i)
+            array.remove(trMA, _i)
+            array.remove(trOA, _i)
+            array.remove(trOT, _i)
+            array.remove(trOH, _i)
+        _i -= 1
+
+// ---- record new triggers (rising edge only: one move = one signal) ----
+// The tracker observes the SAME GO event the engine produces. It does not
+// recreate a signal of its own — that was one of the four brains.
+bool _trFire = (exLong and not exLong[1]) or (exShort and not exShort[1])
+bool _trFree = trAllowMulti or array.size(trE) == 0
+var int trTotal = 0
+if trackOn and _trFire and _trFree and (bar_index - trLastBar) >= trCooldown and not na(exStop) and not na(exTarget) and exRR > 0
+    array.push(trE, close)
+    array.push(trS, exStop)
+    array.push(trT, exTarget)
+    array.push(trD, exDir)
+    array.push(trR, exRR)
+    array.push(trC, math.round(selConfl))
+    array.push(trB, bar_index)
+    array.push(trMF, 0.0)
+    array.push(trMA, 0.0)
+    array.push(trOA, selAuth)
+    array.push(trOT, selTouch)
+    array.push(trOH, selHold)
+    trTotal += 1
+    trLastBar := bar_index
+
+// ---- results ----
+// PHASE 18: every figure states its population. There is no statistic here
+// whose denominator you have to guess at, and timeouts appear explicitly in
+// BOTH win-rate conventions rather than being quietly dropped from one.
+var table trTbl = table.new(position.bottom_left, 2, 12, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.new(color.gray, 70))
+if trackOn and trTable and barstate.islast
+    int   _open   = array.size(trE)
+    int   _closed = trWin + trLoss + trTime
+    // convention A: timeouts EXCLUDED from the population entirely
+    int   _decided = trWin + trLoss
+    float _wrA    = _decided <= 0 ? 0.0 : trWin * 100.0 / _decided
+    // convention B: timeouts INCLUDED as non-wins
+    float _wrB    = _closed <= 0 ? 0.0 : trWin * 100.0 / _closed
+    float _exp    = _closed <= 0 ? 0.0 : trSumR / _closed
+    float _avgW   = trWin  <= 0 ? 0.0 : trSumW / trWin
+    float _avgL   = trLoss <= 0 ? 0.0 : trSumL / trLoss
+    color _tx = color.new(color.white, 10)
+    color _gd = color.new(color.lime, 0)
+    color _bd = color.new(color.red, 0)
+    table.cell(trTbl, 0, 0, "TRACKER · " + execProfile, text_color=_tx, text_size=size.small, text_halign=text.align_left)
+    table.cell(trTbl, 1, 0, str.tostring(trTotal) + " signals", text_color=_tx, text_size=size.small)
+    table.cell(trTbl, 0, 1, "Open / closed", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 1, str.tostring(_open) + " / " + str.tostring(_closed), text_color=_tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 2, "Win / Loss / Timeout", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 2, str.tostring(trWin) + " / " + str.tostring(trLoss) + " / " + str.tostring(trTime), text_color=_tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 3, "Win rate (excl. timeout)", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 3, str.tostring(_wrA, "#.#") + "% of " + str.tostring(_decided), text_color=_wrA >= 50 ? _gd : _tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 4, "Win rate (timeout = non-win)", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 4, str.tostring(_wrB, "#.#") + "% of " + str.tostring(_closed), text_color=_wrB >= 50 ? _gd : _tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 5, "Total R", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 5, str.tostring(trSumR, "#.#") + "R", text_color=trSumR > 0 ? _gd : _bd, text_size=size.tiny)
+    table.cell(trTbl, 0, 6, "Expectancy / closed", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 6, str.tostring(_exp, "#.##") + "R", text_color=_exp > 0 ? _gd : _bd, text_size=size.tiny)
+    table.cell(trTbl, 0, 7, "Average win", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 7, str.tostring(_avgW, "#.##") + "R", text_color=_tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 8, "Average loss", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 8, str.tostring(_avgL, "#.##") + "R", text_color=_tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 9, "Best MFE", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 9, str.tostring(trBestMF, "#.##") + "R", text_color=_tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 10, "Worst MAE", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 10, str.tostring(trWorstMA, "#.##") + "R", text_color=_tx, text_size=size.tiny)
+    table.cell(trTbl, 0, 11, "Max consecutive losses", text_color=_tx, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(trTbl, 1, 11, str.tostring(trMaxConsL), text_color=_tx, text_size=size.tiny)
